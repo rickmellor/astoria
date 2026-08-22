@@ -155,6 +155,18 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
                         else pred.get("layer_hint") or "semantic")
         if lay not in ("semantic", "profile", "procedural"):
             lay = "semantic"
+        # Embed BEFORE taking the per-key lock (TEI ≈ 200 ms) so concurrent writers on one key
+        # don't serialise on the network call. Cheap unlocked pre-check: a same-value re-assert
+        # is a NOOP that needs no vector. (The locked path below re-reads authoritatively.)
+        vec = None
+        if embed and not historical:
+            pre = cur.execute(
+                "SELECT 1 FROM fact WHERE user_id=%s AND subject=%s AND predicate=%s AND status='active' "
+                "AND value_norm=%s LIMIT 1", (user_id, subject, predicate, vnorm)).fetchone()
+            if not pre:
+                vec = embed_one(hook)
+        elif embed:
+            vec = embed_one(hook)
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(user_id, subject, predicate),))
 
         # tombstone guard (cross-tier resurrection): only explicit human re-asserts lift it
@@ -200,7 +212,8 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
         status = status_override or "active"
         if status == "active" and source_kind in ("extracted", "imported", "curator") and conf < s.confidence_staging_threshold:
             status = "staging"
-        vec = embed_one(hook) if embed else None
+        if embed and vec is None:  # pre-check guessed NOOP but the locked read disagreed (rare race)
+            vec = embed_one(hook)
 
         new_id = uuid.uuid4()
 
