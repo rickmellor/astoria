@@ -78,7 +78,7 @@ class Settings(BaseSettings):
 
     # --- service -------------------------------------------------------------
     host: str = "0.0.0.0"
-    port: int = 8940
+    port: int = 8933
     log_level: str = "INFO"
     version: str = "0.1.0"
 

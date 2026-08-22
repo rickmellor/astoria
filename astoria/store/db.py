@@ -23,8 +23,18 @@ _pool: ConnectionPool | None = None
 
 
 def _configure(conn: psycopg.Connection) -> None:
-    register_vector(conn)
     conn.row_factory = dict_row
+    try:
+        register_vector(conn)
+    except psycopg.ProgrammingError:  # fresh DB before `CREATE EXTENSION vector` — migrate() bootstraps it
+        pass
+
+
+def bootstrap_extensions() -> None:
+    """Create required extensions with a plain connection (before the pool registers pgvector)."""
+    with psycopg.connect(settings().db_dsn, autocommit=True) as c:
+        c.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        c.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 
 
 def pool() -> ConnectionPool:
@@ -60,6 +70,8 @@ def conn() -> Iterator[psycopg.Connection]:
 def migrate() -> list[str]:
     """Apply any unapplied astoria/sql/*.sql in lexical order. Returns versions applied."""
     applied: list[str] = []
+    bootstrap_extensions()
+    close_pool()  # re-open so every pooled connection registers the vector type
     files = sorted(
         (p for p in resources.files("astoria.sql").iterdir() if p.name.endswith(".sql")),
         key=lambda p: p.name,

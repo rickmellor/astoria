@@ -1,6 +1,6 @@
 # Astoria on the NAS — /volume1/docker/astoria
 #   astoria-postgres : pgvector/pgvector:pg18, data in ./pgdata (bind mount, in backup scope)
-#   astoria          : the service (REST :8940 + MCP /mcp) + in-container workers
+#   astoria          : the service (REST :8933 + MCP /mcp) + in-container workers
 # Embeddings come from the existing always-on TEI nomic container (memoryos-tei, :8931)
 # via the host IP — separate compose, same NAS (the MegaPlan→MemoryOS pattern).
 services:
@@ -11,7 +11,7 @@ services:
     volumes:
       - ./pgdata:/var/lib/postgresql    # pg18 image uses /var/lib/postgresql (not /data)
     ports:
-      - "127.0.0.1:8941:5432"           # local-only; the service reaches it on the compose net
+      - "127.0.0.1:8934:5432"           # local-only; the service reaches it on the compose net
     shm_size: 256m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-astoria} -d ${POSTGRES_DB:-astoria}"]
@@ -32,7 +32,7 @@ services:
       - ./backups:/backups              # pg_dump rotation written by the in-container scheduler
       - ./data:/data                    # importer staging, logs
     ports:
-      - "8940:8940"
+      - "8933:8933"
     depends_on:
       astoria-postgres:
         condition: service_healthy
