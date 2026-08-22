@@ -1,0 +1,39 @@
+# Astoria on the NAS — /volume1/docker/astoria
+#   astoria-postgres : pgvector/pgvector:pg18, data in ./pgdata (bind mount, in backup scope)
+#   astoria          : the service (REST :8940 + MCP /mcp) + in-container workers
+# Embeddings come from the existing always-on TEI nomic container (memoryos-tei, :8931)
+# via the host IP — separate compose, same NAS (the MegaPlan→MemoryOS pattern).
+services:
+  astoria-postgres:
+    image: pgvector/pgvector:pg18
+    container_name: astoria-postgres
+    env_file: .env                      # POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB
+    volumes:
+      - ./pgdata:/var/lib/postgresql    # pg18 image uses /var/lib/postgresql (not /data)
+    ports:
+      - "127.0.0.1:8941:5432"           # local-only; the service reaches it on the compose net
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-astoria} -d ${POSTGRES_DB:-astoria}"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  astoria:
+    build:
+      context: ../..                    # repo root (Dockerfile there)
+    image: astoria:latest
+    container_name: astoria
+    env_file: .env
+    environment:
+      ASTORIA_DB_DSN: postgresql://${POSTGRES_USER:-astoria}:${POSTGRES_PASSWORD}@astoria-postgres:5432/${POSTGRES_DB:-astoria}
+    volumes:
+      - ./backups:/backups              # pg_dump rotation written by the in-container scheduler
+      - ./data:/data                    # importer staging, logs
+    ports:
+      - "8940:8940"
+    depends_on:
+      astoria-postgres:
+        condition: service_healthy
+    restart: unless-stopped

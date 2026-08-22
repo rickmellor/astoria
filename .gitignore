@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+deploy/nas/.env
+deploy/nas/pgdata/
+deploy/nas/backups/
+deploy/nas/data/
+.pytest_cache/
+.ruff_cache/
+*.log
