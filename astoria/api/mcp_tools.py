@@ -168,7 +168,7 @@ def build_mcp():
         "entity:<name>" or "fact:<uuid>"):
           graph       node[, depth] — the neighbourhood of a node: {root, nodes[{id,kind,hops,via,label}], edges}.
           edges       [node, relation, depth] — list edges (touching node / within depth hops).
-          edge_add    src, relation, dst[, confidence, evidence] — assert a link ("johnny" runs_on "specul8-o-matic";
+          edge_add    src, relation, dst[, confidence, evidence] — assert a link ("buildbot" runs_on "workstation-1";
                       relations snake_case: part_of, located_in, works_at, owns, runs_on, depends_on, related_to).
           edge_delete edge_id — retract an edge.
           aliases     [canonical] — subject aliases (alias → canonical name).

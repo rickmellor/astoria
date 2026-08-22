@@ -53,12 +53,12 @@ Astoria service over HTTP (it never touches the database).
   [cyan]astoria staging[/cyan] → [cyan]astoria approve ID[/cyan]               → review extracted facts
   [cyan]astoria briefing[/cyan] · [cyan]astoria profile[/cyan]                  → stable prompt prefix / who the user is
   [cyan]astoria graph buildbot[/cyan] · [cyan]astoria edge add A runs_on B[/cyan]   → walk / extend the entity graph
-  [cyan]astoria alias add specul8 workstation-1[/cyan]       → two names, one subject
+  [cyan]astoria alias add ws1 workstation-1[/cyan]       → two names, one subject
 
 [bold]Environment[/bold]
   ASTORIA_URL    service base URL   (default http://localhost:8933)
   ASTORIA_TOKEN  bearer token → client name server-side (sent as Authorization: Bearer)
-  ASTORIA_USER   default user_id    (default alice)
+  ASTORIA_USER   default user_id   (default: empty → the server's ASTORIA_USER_DEFAULT)
 
 Short fact ids (first 8 chars, as printed in tables) are accepted anywhere an ID is expected.
 Dates accept YYYY-MM-DD, ISO-8601, or "now" / "today" / "yesterday" / "3 days ago" / "2 weeks ago".
@@ -1267,7 +1267,7 @@ def alias_add(
     """Declare ALIAS to mean CANONICAL (POST /aliases): every later write/read on ALIAS lands on
     CANONICAL. Chains are flattened; the user_id itself cannot be aliased away.
 
-    [dim]Example:[/dim]  [cyan]astoria alias add specul8 workstation-1[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria alias add ws1 workstation-1[/cyan]
     """
     c = _ctx(ctx).client
     res = _run(ctx, c.add_alias, alias, canonical)
@@ -1309,7 +1309,7 @@ def alias_rm(
 ):
     """Remove an alias (DELETE /aliases/ALIAS). Facts already written under the canonical name stay.
 
-    [dim]Example:[/dim]  [cyan]astoria alias rm specul8[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria alias rm ws1[/cyan]
     """
     c = _ctx(ctx).client
     res = _run(ctx, c.delete_alias, alias)
