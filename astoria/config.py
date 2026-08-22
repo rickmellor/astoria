@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     # --- embeddings (NAS TEI nomic, 768-d, pinned) --------------------------
     embed_url: str = "http://192.168.1.134:8931"
+    # priority list "url|model,url|model": workstation nomic seat via SAINT first (fast, nightly-off),
+    # then the always-on NAS TEI. Empty → embed_url only.
+    embed_urls: str = "http://192.168.1.221:4000|saint-local-embed,http://192.168.1.134:8931|nomic"
     embed_dim: int = 768
     embed_require_substring: str = "nomic-embed"     # served-model assertion
     embed_timeout_s: float = 20.0
