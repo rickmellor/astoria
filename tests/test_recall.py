@@ -149,7 +149,7 @@ def test_stale_hint_flips_on_newer_episode(uid):
     with db.conn() as c:
         _episode(c, uid, "my favorite beer is stout these days",
                  "User: honestly my favorite beer is stout these days.\nAssistant: Noted.",
-                 kind="note", occurred_at=NOW + timedelta(seconds=5))
+                 kind="note", occurred_at=NOW + timedelta(minutes=10))
     res = _recall(uid, "what beer do I like")
     ipa = [it for it in res["items"] if it.get("value") == "IPA"][0]
     assert ipa["stale_hint"] is True
