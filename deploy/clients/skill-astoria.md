@@ -24,7 +24,7 @@ only for a targeted lookup beyond that.
 
 **Remember** — prefer `remember(subject, predicate, value, user_id="the user")` for an
 explicit, durable fact the user states ("my favorite beer is IPA", "I use Neovim",
-"the NAS is at 192.168.1.134"). It supersedes any current value for a functional
+"the NAS is at 10.0.0.5"). It supersedes any current value for a functional
 predicate (favorite_/default_/primary_/preferred_/current_*, *_is, *_name) and keeps
 the history. Pass `retract=True` when something has stopped being true; pass
 `valid_from`/`valid_to` (ISO dates) for time-bounded facts.
