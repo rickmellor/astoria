@@ -73,5 +73,20 @@ docs/        CONTRACT.md (the API/MCP contract) · more in docs/
 tests/       unit · concurrency · acceptance (T1–T12) · scripts/smoke.sh
 ```
 
+## Docs
+
+| doc | what |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | layers, data model (bitemporal + `asserted_at`, cardinality, tombstones, trust numbers), write path (capture → detector → cognify), read path, worker/curator schedule, degrade behaviour, compat layer, limitations/roadmap |
+| [docs/API.md](docs/API.md) | every REST route with request/response + curl examples, MCP tools and arguments, auth/tokens, error shapes, MemoryOS-compat routes, client wiring |
+| [docs/CLI.md](docs/CLI.md) | the `astoria` CLI: setup, workflows, a test-drive script, full `--help` for every subcommand |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | deploy/redeploy, `.env` keys, logs, health, queue/dead-letter handling, backups + step-by-step restore, schema upgrades, troubleshooting, capacity knobs, tests |
+| [docs/SECURITY.md](docs/SECURITY.md) | LAN-only posture, tokens and trust model, secrets locations, data handling, no telemetry |
+| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | measured latency/throughput, the 10k-fact benchmark (`scripts/bench/`) |
+| [docs/CONTRACT.md](docs/CONTRACT.md) | the fixed build contract (interfaces, numbers) |
+
+Status: **live on the NAS since 2026-08-22** (`http://192.168.1.134:8933`), replacing MemoryOS;
+homelab-level notes (ports, client wiring, decommission record) in `~/projects/infrastructure/astoria.md`.
+
 Design & rationale: `~/projects/infrastructure/astoria/{research,requirements,dossiers,DESIGN}.md`.
 License: MIT.
