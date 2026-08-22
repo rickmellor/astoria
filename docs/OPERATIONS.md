@@ -1,248 +1,255 @@
 # Astoria — operations runbook
 
-Running, deploying, backing up, restoring and debugging the live service on the NAS. Architecture is
-in [ARCHITECTURE.md](ARCHITECTURE.md); the homelab-level view (ports, client wiring, decommission
-record) is `~/projects/infrastructure/astoria.md`. Performance numbers: [PERFORMANCE.md](PERFORMANCE.md).
+Deploying, upgrading, backing up, restoring, watching and debugging an Astoria service. Architecture is
+in [ARCHITECTURE.md](ARCHITECTURE.md), every knob in [CONFIGURATION.md](CONFIGURATION.md), measured
+capacity in [PERFORMANCE.md](PERFORMANCE.md). Commands assume the compose stack in `deploy/nas/`
+(service `astoria`, database `astoria-postgres`, sidecar `astoria-backup`, optional `astoria-rerank`) and
+use `http://nas.local:8933` as the service URL.
 
-## 1. Where things are
+## 1. Components at a glance
 
-| what | where |
-|---|---|
-| service | `http://192.168.1.134:8933` (REST) · `/mcp/` (MCP) · `/docs` (OpenAPI) · `/health` |
-| NAS deployment dir | `/volume1/docker/astoria/` — `docker-compose.yml` (rendered by deploy.sh), `.env` (**secrets, mode 600, root**), `src/` (repo copy, build context), `pgdata/` (Postgres bind mount), `backups/` (pg_dump rotation), `data/` (service scratch) |
-| containers | `astoria` (service, `:8933`), `astoria-postgres` (pgvector pg18, **`127.0.0.1:8934` NAS-local only**), `astoria-backup` (pg_dump sidecar), plus the pre-existing `memoryos-tei` (`:8931`, separate compose at `/volume1/docker/memoryos/`, now "tei only") |
-| source of truth | `~/repos/astoria` on the workstation (git, branch `main`); `deploy/nas/` holds compose + deploy.sh + `.env.example` |
-| workstation client config | `~/.config/astoria/env` (mode 600): `ASTORIA_URL`, `ASTORIA_TOKEN`, `ASTORIA_TOKEN_INPUT`, `ASTORIA_TOKEN_CLAUDE_CODE`, `ASTORIA_TOKEN_MEGAPLAN` |
-| dev DB | `astoria-dev-pg` container on the workstation, `127.0.0.1:55432` (the default `ASTORIA_DB_DSN`); used by the unit/concurrency tests |
-| SSH | `ssh root-dxp4800gt` (root alias; UGOS: `rick` is sudo-free and user cron is blocked — hence the in-container worker and the backup sidecar) |
-
-## 2. Deploy / redeploy
-
-```bash
-cd ~/repos/astoria
-./deploy/nas/deploy.sh              # build + (re)start   — after any code change
-./deploy/nas/deploy.sh --no-build   # restart only        — after a .env change
-```
-
-What `deploy.sh` does (read it: `deploy/nas/deploy.sh`):
-1. `ssh root-dxp4800gt mkdir -p /volume1/docker/astoria/{src,pgdata,backups,data}` and `chown 1000:1000 data backups`.
-2. tars the repo (minus `.git`, `.venv`, caches, and `deploy/nas/{.env,pgdata,backups,data}`) over SSH into `…/astoria/src` (UGOS rsync is restricted).
-3. renders `deploy/nas/docker-compose.yml` → `/volume1/docker/astoria/docker-compose.yml` (build context rewritten to `./src`), **refuses to continue if `.env` is missing**.
-4. `docker compose up -d --build --remove-orphans && docker compose ps`, then curls `/health`.
-
-First-time bootstrap on a new host: copy `deploy/nas/.env.example` to `/volume1/docker/astoria/.env`,
-fill the secrets (§3), `chmod 600`, then run `deploy.sh`. The schema is applied automatically at service
-start (`db.migrate()`), so a fresh `pgdata/` comes up empty but working.
-
-Env-only changes (tokens, key, log level) need the container recreated: `deploy.sh --no-build` does
-`docker compose up -d`, which recreates `astoria` because its `env_file` changed. Override host/dir with
-`ASTORIA_NAS_SSH` / `ASTORIA_NAS_DIR`.
-
-After every deploy: `scripts/smoke.sh` (health + MCP handshake + the T1 correction test on a throwaway
-user) — takes ~5 s, prints PASS/FAIL per check.
-
-## 3. `.env` keys (NAS: `/volume1/docker/astoria/.env`, never in git)
-
-| key | used by | meaning |
+| component | what | where it listens |
 |---|---|---|
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | postgres, astoria (DSN is composed in compose), backup | DB credentials (`astoria`/`astoria` + a generated password) |
-| `BACKUP_INTERVAL_S` (21600) / `BACKUP_KEEP` (14) | astoria-backup | dump cadence / rotation depth |
-| `ASTORIA_USER_DEFAULT` | astoria | default `user_id` (`rick`) |
-| `ASTORIA_EMBED_URL` / `ASTORIA_EMBED_DIM` | astoria | TEI endpoint (`http://192.168.1.134:8931`, 768); served model must contain `nomic-embed` |
-| `ASTORIA_LLM_URL` / `ASTORIA_LLM_MODEL` | astoria (cognify) | SAINT `http://192.168.1.221:4000/v1`, `saint-cloud-medium` |
-| `ASTORIA_LLM_FALLBACK_MODEL` | astoria (cognify) | `claude-sonnet-4-6` via direct Anthropic |
-| `ANTHROPIC_API_KEY` | astoria (cognify fallback) | **set → the overnight direct-cloud path is ENABLED** (SAINT is off nightly) |
-| `ASTORIA_CLIENT_TOKENS` | astoria (auth) | `input:…,claude-code:…,cli:…,megaplan:…` — Bearer token → client name |
-| `ASTORIA_LOG_LEVEL` | astoria | `INFO` |
-| `ASTORIA_WORKER_ENABLED` | astoria | `true`; `false` = API-only (no cognify/curator) |
+| `astoria` | FastAPI + FastMCP + in-process worker (one uvicorn worker) | `:8933` REST, `/mcp/` MCP, `/docs` OpenAPI, `/health` |
+| `astoria-postgres` | Postgres 18 + pgvector, bind-mounted `./pgdata` | `127.0.0.1:8934` on the host only |
+| `astoria-backup` | `pg_dump -Fc` every `BACKUP_INTERVAL_S`, keep `BACKUP_KEEP` | writes `./backups/astoria-YYYY-MM-DD-HHMM.dump` |
+| `astoria-rerank` (optional) | TEI cross-encoder reranker | `:8935` |
+| embedder (external) | any nomic-embed-text-v1.5 endpoint(s) named in `ASTORIA_EMBED_URLS` | — |
+| LLM (external) | OpenAI-compatible gateway named in `ASTORIA_LLM_URL`; optional Anthropic fallback | — |
 
-Other knobs (all `ASTORIA_*`, see `astoria/config.py`; the wired ones): `DB_POOL_MIN/MAX` (1/8),
-`EMBED_TIMEOUT_S` (20), `EMBED_MAX_CHARS` (6000), `LLM_TIMEOUT_S` (120), `RECALL_MIN_COSINE` (0.48),
-`CONFIDENCE_FLOOR/CAP/STAGING_THRESHOLD` (.05/.98/.35), `COGNIFY_BATCH` (4), `HOST/PORT`.
-`ASTORIA_DB_DSN` is set by compose (`postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@astoria-postgres:5432/$POSTGRES_DB`).
+## 2. Deploy and upgrade
 
-## 4. Health, status, logs
+First deployment:
 
 ```bash
-curl -s http://192.168.1.134:8933/health | jq .          # 200 iff DB ok; tei.ok / llm.saint / queue.{pending,dead}
-astoria status                                           # same, as a table; exit 0 iff ok
-ssh root-dxp4800gt 'docker ps --format "{{.Names}} {{.Status}} {{.Ports}}" | grep -E "astoria|tei"'
-ssh root-dxp4800gt 'cd /volume1/docker/astoria && docker compose ps'
-ssh root-dxp4800gt 'docker logs --since 1h astoria'        # service log
-ssh root-dxp4800gt 'docker logs --tail 20 astoria-backup'  # "backup ok /backups/astoria-…dump" lines
-ssh root-dxp4800gt 'docker logs --tail 50 astoria-postgres'
+# on the host that runs the stack
+mkdir -p astoria && cd astoria
+cp <repo>/deploy/nas/.env.example .env            # fill POSTGRES_PASSWORD, endpoints, ASTORIA_USER_DEFAULT, tokens; chmod 600
+cp <repo>/deploy/nas/docker-compose.yml .         # point `build.context` at the repo checkout (or use a prebuilt image)
+mkdir -p pgdata backups data
+docker compose up -d --build astoria-postgres astoria astoria-backup
+# optional reranker: put a Hugging Face snapshot of cross-encoder/ms-marco-MiniLM-L-6-v2 (incl. onnx/model.onnx)
+# in ./rerank-model, then `docker compose up -d astoria-rerank` and set ASTORIA_RERANK_URLS; leave the
+# variable empty to run without the stage
+curl -s http://nas.local:8933/health | jq .status  # "ok"
 ```
 
-Log streams in `docker logs astoria` (json-file driver, 10 MB × 3):
-- JSON request lines `{"ts","method","path","status","ms","client"}` — one per HTTP request (no bodies);
-- uvicorn access lines (`GET /episodes?user_id=rick&limit=5 HTTP/1.1" 200 OK` — query strings included);
-- Python logging: `astoria.cognify.worker` (`acquired leader lock 43`, `drain: {...}`, `cognify done user=…
-  facts=N`), `astoria.llm` (`SAINT unavailable … trying direct Anthropic`), `astoria.embed`
-  (`embedding failed (degrading)`, `embedding model mismatch`), `astoria.curator`, httpx request lines.
+`deploy/nas/deploy.sh` is a reference script for the "build on a workstation, ship the source tree over
+ssh, compose up" pattern; it reads the target host and directory from `ASTORIA_NAS_SSH` /
+`ASTORIA_NAS_DIR`, never copies `.env`, and rewrites the compose build context to the shipped source
+directory. Adapt it or replace it with your registry/CI flow.
 
-Container health: the `astoria` image has a `HEALTHCHECK` on `/health` (60 s); compose waits for
-`astoria-postgres` `pg_isready` before starting the service and the backup sidecar.
-
-## 5. Cognify queue and dead letters
-
-`/health.queue` → `{pending (pending+failed+running), dead, by_state}`; `astoria queue` shows the same.
-The worker drains every 30 s (immediately after start), 4 jobs per tick, one LLM call per coalesced
-session chunk; failures back off 1/5/15/60/240 min and go `dead` after 5 attempts.
+Upgrade = rebuild the image and restart the service; **migrations apply themselves** at start-up
+(`astoria/sql/NNN_*.sql` in lexical order, each recorded in `schema_migrations`):
 
 ```bash
-# inspect (psql inside the container; local socket = no password)
-ssh root-dxp4800gt 'docker exec astoria-postgres psql -U astoria -d astoria -c \
-  "SELECT id, user_id, session_id, state, attempts, next_attempt_at, left(last_error,120) err FROM cognify_queue WHERE state IN ('"'"'failed'"'"','"'"'dead'"'"','"'"'running'"'"') ORDER BY id"'
-
-# replay dead jobs (e.g. after the LLM path is fixed)
-ssh root-dxp4800gt 'docker exec astoria-postgres psql -U astoria -d astoria -c \
-  "UPDATE cognify_queue SET state='"'"'pending'"'"', attempts=0, next_attempt_at=now(), last_error=NULL, finished_at=NULL WHERE state='"'"'dead'"'"'"'
-
-# give up on them instead
-…  "UPDATE cognify_queue SET state='skipped', finished_at=now() WHERE state='dead'"
-
-# force an immediate drain: restart the service (drains on the first tick)
-ssh root-dxp4800gt 'cd /volume1/docker/astoria && docker compose restart astoria'
+docker compose up -d --build astoria             # code change
+docker compose up -d astoria                     # .env change only (recreates the container)
+docker logs astoria 2>&1 | grep -m1 'migrations applied'   # lists newly applied versions, if any
 ```
 
-Rows stuck in `running` (a crash mid-job) are reclaimed automatically after 30 min. Jobs whose
-episode was deleted are marked `skipped`. `payload.result` on `done` rows records what was extracted
-(`{facts, retracted, summary_episode, nothing_durable}`). If `pending` grows while `astoria` is up, check
-§8 (LLM) and §9 (advisory lock).
+A new schema file is additive and idempotent (`CREATE … IF NOT EXISTS`, `ALTER TABLE … SET`). A rollback
+of the code does not roll back the schema; keep schema changes backward-compatible with the previous
+release or restore from a dump.
+
+After any deploy:
+
+```bash
+ASTORIA_URL=http://nas.local:8933 scripts/smoke.sh
+```
+
+`smoke.sh` checks `/health` (db, tei, version, queue), the MCP handshake (`initialize` → `tools/list`
+must contain `recall capture remember forget memory retrieve_memory add_memory get_user_profile`), a full
+correct-and-recall cycle on a throwaway user (`POST /facts` → `POST /correct` → `GET /facts` → `POST
+/recall` → detector path via `/capture`), then `DELETE /users/{id}`. Exit 0 iff every check passed.
+
+## 3. Health and status
+
+```bash
+curl -s http://nas.local:8933/health | jq .        # status/version, db counts, queue, tei endpoints, llm, rerank
+astoria status                                     # the same as a table
+astoria queue                                      # POST /op queue_stats
+docker compose ps                                  # container state, restarts
+```
+
+What to look at:
+
+| field | healthy | meaning when not |
+|---|---|---|
+| `status` | `ok` (HTTP 200) | `error` / 503 — database unreachable |
+| `tei.ok`, `tei.active` | `true`, the endpoint you expect first | no usable embedding endpoint → recall BM25-only, new rows unembedded until one returns |
+| `tei.endpoints[].verified / error` | verified, no error | `not nomic` / dim mismatch → wrong model behind that URL (disabled for 10 min); connect errors → down (retried after 60 s) |
+| `llm.saint` | `reachable` | primary gateway unreachable; cognify uses the Anthropic fallback if `llm.fallback` is true, else jobs back off |
+| `rerank.status` | `on` (or `off` if you disabled it) | `down` — reranker endpoints unreachable; recall keeps the base order |
+| `queue.pending` | small, not growing | growing → LLM path broken or the worker is not the leader (§4) |
+| `queue.dead` | 0 | jobs that exhausted 5 attempts (§4) |
+
+## 4. Cognify queue, worker, dead letters
+
+The worker ticks every `ASTORIA_COGNIFY_POLL_S` (30 s; immediately after start): embed backfill, then up to
+`ASTORIA_COGNIFY_BATCH` (4) jobs coalesced per session → one LLM call each; failures back off 1 / 5 / 15 /
+60 / 240 min and go `dead` after 5 attempts. Only the process holding advisory lock 43 drains.
+
+```bash
+# what is in the queue (by state, oldest, last 20 dead jobs, embedding backlog)
+curl -s -X POST http://nas.local:8933/op -H 'Content-Type: application/json' -d '{"action":"queue_stats"}' | jq .
+
+# inspect failed/dead rows in SQL (local socket inside the container needs no password)
+docker exec astoria-postgres psql -U astoria -d astoria -c \
+  "SELECT id, user_id, session_id, state, attempts, next_attempt_at, left(last_error,120) err
+     FROM cognify_queue WHERE state IN ('failed','dead','running') ORDER BY id"
+
+# replay dead jobs after fixing the cause (they are picked up on the next tick)
+docker exec astoria-postgres psql -U astoria -d astoria -c \
+  "UPDATE cognify_queue SET state='pending', attempts=0, next_attempt_at=now(), last_error=NULL, finished_at=NULL WHERE state='dead'"
+
+# or give up on them
+docker exec astoria-postgres psql -U astoria -d astoria -c \
+  "UPDATE cognify_queue SET state='skipped', finished_at=now() WHERE state='dead'"
+
+# force an immediate drain
+docker compose restart astoria
+
+# who holds the leader lock? (a second service instance or a developer process pointed at this DB idles)
+docker exec astoria-postgres psql -U astoria -d astoria -c \
+  "SELECT pid, application_name, client_addr, state FROM pg_stat_activity
+    WHERE pid IN (SELECT pid FROM pg_locks WHERE locktype='advisory' AND objid=43)"
+```
+
+Rows stuck in `running` (a crash mid-job) are reclaimed automatically after 30 minutes. Jobs whose episode
+was deleted are marked `skipped`. `payload.result` on `done` rows records what was extracted.
+
+Embedding backlog (`embed_backlog` in `queue_stats`): with the asynchronous write path every new fact and
+episode waits for the next tick to be embedded; a backlog that does not drain means every embedding
+endpoint is down (`/health.tei`).
+
+## 5. Logs
+
+- Service: `docker logs -f astoria`. Two kinds of lines on stdout: the JSON request log
+  `{"ts","method","path","status","ms","client"}` (no bodies; uvicorn's own access log adds query
+  strings) and Python logging for `astoria.*` (`ASTORIA_LOG_LEVEL`). Worker lines of interest:
+  `worker: acquired leader lock 43`, `drain: {...}`, `cognify done user=… facts=… retracted=…`,
+  `embed_backfill: …`, `rederive_profile …`, `reflect …`, `dedup_facts …`, `decay …`,
+  `prune_snapshots: …`, `embedding endpoint … failed … cooling down`, `rerank endpoint … failed`,
+  `SAINT unavailable … trying direct Anthropic` (primary LLM down).
+- Database: `docker logs astoria-postgres`.
+- Backups: `docker logs astoria-backup` (`backup ok /backups/…` or `backup FAILED`).
+- Compose keeps ≤ 30 MB of log per container (`json-file`, 3 × 10 MB).
 
 ## 6. Backups
 
-- **What**: `astoria-backup` sidecar (same `pgvector/pgvector:pg18` image, so `pg_dump` matches the
-  server major) runs `pg_dump -Fc` over the compose network every `BACKUP_INTERVAL_S` (6 h, first one
-  60 s after start), writes `astoria-YYYY-MM-DD-HHMM.dump` atomically (`.tmp` → `mv`), and prunes to the
-  newest `BACKUP_KEEP` (14) files → `/volume1/docker/astoria/backups/` (≈ 3.5 days of 6-hourly dumps).
-  Log line `backup ok /backups/…` / `backup FAILED`.
-- **Verified**: the first dump (`astoria-2026-08-22-1709.dump`, 52 KB) lists cleanly with
-  `pg_restore --list` (68 TOC entries, server 18.6).
-- **Check**:
-  ```bash
-  ssh root-dxp4800gt 'ls -lt /volume1/docker/astoria/backups | head; docker logs --tail 3 astoria-backup'
-  ssh root-dxp4800gt 'docker run --rm -v /volume1/docker/astoria/backups:/b:ro pgvector/pgvector:pg18 \
-      pg_restore --list /b/$(ls -t /volume1/docker/astoria/backups | head -1) | head -15'
-  ```
-- **Logical copy** (portable, human-readable, per user): `astoria export -o rick-$(date +%F).json`;
-  re-import anywhere with `astoria import`.
-- **Gap**: the dumps live on the same NAS RAID1 pool as `pgdata/` — drive failure is covered,
-  NAS loss is not. An off-box copy (e.g. a workstation timer pulling the newest dump) is the next step.
-
-## 7. Restore (step by step, into the running container)
-
-Use when the data is corrupted/wiped and you want to roll back to a dump. Takes a couple of minutes.
+The `astoria-backup` sidecar runs `pg_dump -Fc` over the compose network every `BACKUP_INTERVAL_S`
+(default 6 h, first one 60 s after start), writes `astoria-YYYY-MM-DD-HHMM.dump` atomically (`.tmp` →
+`mv`), and prunes to the newest `BACKUP_KEEP` (14) files in `./backups/`. The dump is the whole database
+(schema + all users + queue + audit), compressed, **not encrypted**.
 
 ```bash
-ssh root-dxp4800gt
-cd /volume1/docker/astoria
-ls -lt backups | head                                   # 1. pick the dump
+ls -lt backups | head                                                  # newest first
+docker logs --tail 3 astoria-backup                                    # last outcomes
+docker run --rm -v "$PWD/backups:/b:ro" pgvector/pgvector:pg18 \
+  pg_restore --list /b/$(ls -t backups | head -1) | head -15         # the dump lists cleanly
+```
+
+Off-site copy — dumps on the same disks as `pgdata/` protect against data corruption and operator error,
+not against losing the host. An example pull from another machine (cron/systemd timer):
+
+```bash
+# on the off-site machine
+rsync -az --delete nas.local:/path/to/astoria/backups/ /srv/backups/astoria/
+# or, if only the newest dump is wanted:
+scp "nas.local:/path/to/astoria/backups/$(ssh nas.local 'ls -t /path/to/astoria/backups | head -1')" /srv/backups/astoria/
+```
+
+Portable, human-readable per-user copies: `astoria export -o alice-$(date +%F).json` → `astoria import`
+anywhere (logical, idempotent; see CLI.md).
+
+## 7. Restore
+
+Into the running stack, from a dump (a few minutes):
+
+```bash
+cd /path/to/astoria
+ls -lt backups | head                                      # 1. pick the dump
 DUMP=backups/astoria-2026-08-22-1709.dump
-docker run --rm -v $PWD/backups:/b:ro pgvector/pgvector:pg18 pg_restore --list /b/$(basename $DUMP) | head   # 2. sanity: TOC lists
-docker compose stop astoria astoria-backup              # 3. stop writers (postgres stays up)
-docker cp $DUMP astoria-postgres:/tmp/restore.dump      # 4. put the dump inside the DB container
-# 5a. in-place restore (drops+recreates objects the dump contains; keeps the DB and extensions)
+docker run --rm -v "$PWD/backups:/b:ro" pgvector/pgvector:pg18 pg_restore --list /b/$(basename $DUMP) | head   # 2. sanity
+docker compose stop astoria astoria-backup                 # 3. stop writers (postgres stays up)
+docker cp $DUMP astoria-postgres:/tmp/restore.dump         # 4. dump into the DB container
+# 5a. in-place (drops and recreates the objects the dump contains; keeps DB + extensions)
 docker exec astoria-postgres pg_restore -U astoria -d astoria --clean --if-exists --no-owner --exit-on-error /tmp/restore.dump
-#   — or — 5b. fresh database (cleanest; requires no connections, which step 3 ensured)
+#  — or — 5b. fresh database (cleanest; step 3 ensured no connections)
 # docker exec astoria-postgres psql -U astoria -d postgres -c 'DROP DATABASE astoria' -c 'CREATE DATABASE astoria'
+# docker exec astoria-postgres psql -U astoria -d astoria -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto'
 # docker exec astoria-postgres pg_restore -U astoria -d astoria --no-owner --exit-on-error /tmp/restore.dump
 docker exec astoria-postgres rm /tmp/restore.dump
 docker exec astoria-postgres psql -U astoria -d astoria -c "SELECT count(*) facts FROM fact" -c "SELECT version FROM schema_migrations"   # 6. check
-docker compose start astoria astoria-backup             # 7. restart; migrate() is a no-op for already-applied versions
-curl -s http://192.168.1.134:8933/health | jq .db        # 8. facts_active back to the expected count
+docker compose start astoria astoria-backup                # 7. restart; migrate() is a no-op for applied versions
+curl -s http://nas.local:8933/health | jq .db              # 8. counts back to the expected values
 ```
 
 Notes: the postgres image trusts local-socket connections, so `docker exec … -U astoria` needs no
-password (the sidecar uses `PGPASSWORD` over TCP). `--clean --if-exists` emits harmless notices for
-objects that do not exist yet. If `pg_restore` complains about `CREATE EXTENSION vector` on a fresh DB,
-run `psql -U astoria -d astoria -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS
-pgcrypto'` first and retry. A restore into a *different* host: bring up the compose stack there with an
-empty `pgdata/`, let the service create the schema once, then follow the same steps.
+password. `--clean --if-exists` emits harmless notices for objects that do not exist yet. To restore into
+a **different host**, bring the compose stack up there with an empty `pgdata/`, let the service create
+the schema once, then follow the same steps. To restore a **single user** without touching others: run a
+scratch stack from the dump, `astoria export` that user, `astoria import` into production.
 
-To restore a **single user** without touching others: `astoria export` from a scratch stack restored
-from the dump, then `astoria import` into production (logical, idempotent).
+## 8. Capacity knobs (measured basis in PERFORMANCE.md)
 
-## 8. Schema upgrades
-
-Migrations are plain SQL files in `astoria/sql/NNN_name.sql` (packaged with the wheel), applied in
-lexical order by `db.migrate()` at every service start; each version is recorded in
-`schema_migrations` and never re-run. To add one:
-
-1. `astoria/sql/002_<what>.sql` — write statements idempotently anyway (`IF NOT EXISTS`, `ADD COLUMN IF
-   NOT EXISTS`, `ON CONFLICT DO NOTHING`); end with `INSERT INTO schema_migrations(version) VALUES
-   ('002_<what>') ON CONFLICT DO NOTHING;` (migrate() also records it).
-2. run the tests against the dev DB (`pytest`), then `./deploy/nas/deploy.sh` — the container rebuilds
-   (SQL is package data) and applies the file at startup (`migrations applied: ['002_…']` in the log).
-3. **Back up first** for anything destructive — the sidecar dump is at most 6 h old, or force one:
-   `ssh root-dxp4800gt 'docker exec astoria-backup sh -c "pg_dump -Fc -h astoria-postgres -U astoria astoria > /backups/astoria-manual-$(date +%F-%H%M).dump"'`.
-4. If a migration fails, the service keeps booting (`db.migrate failed at startup; continuing`) and
-   `/health` still works; fix the file and redeploy — nothing partial is recorded because each file runs
-   in one transaction before its `schema_migrations` insert.
-
-Postgres major upgrades: `pgdata/` is a bind mount of the pg18 image layout (`/var/lib/postgresql`);
-moving majors = dump with the old image, start the new image on an empty `pgdata/`, restore (§7).
+| knob | default | where |
+|---|---|---|
+| service memory | 768 MiB | compose `mem_limit` (`astoria`) |
+| Postgres memory | 1 GiB limit, `shared_buffers=256MB`, `maintenance_work_mem=128MB`, `shm_size 256m` | compose `astoria-postgres` — raise to 2–3 GiB / 768 MB–1 GB shared_buffers before ~150–200 k embedded rows (HNSW + TOAST ≈ 8.6 KB/row; the hot graph must fit the page cache) |
+| DB pool | `ASTORIA_DB_POOL_MIN/MAX` 1 / 8 | keep `MAX` ≥ expected concurrent recalls |
+| uvicorn workers | 1 (by design) | `Dockerfile` CMD |
+| write-path embedding | asynchronous (`ASTORIA_EMBED_SYNC=false`); backfill 200 facts + 200 episodes per 30 s tick | `.env`; `worker.EMBED_BACKFILL_LIMIT` |
+| embedding endpoints | priority list, fastest first | `ASTORIA_EMBED_URLS` — the embedder, not Postgres, was the throughput ceiling in the scale run (CPU TEI ≈ 6.5 embeds/s) |
+| reranker | top-30 facts + 6 episodes, 240-char texts, weight 0.6, 3 s timeout | `ASTORIA_RERANK_*`; a GPU reranker allows a larger `TOP_N` |
+| recall candidates | 40 vector ⊕ 40 BM25 facts, 20 ⊕ 20 episodes, `hnsw.ef_search=64`, `iterative_scan=relaxed_order`, cosine ≥ 0.45 | `retrieval/recall.py` constants, `ASTORIA_RECALL_MIN_COSINE` |
+| cognify | 4 jobs / 30 s tick, ≤ 8 episodes or 6000 chars per LLM call, 120 s LLM timeout | `ASTORIA_COGNIFY_*`, `ASTORIA_LLM_TIMEOUT_S` |
+| retention | snapshots 90 d; working turns archived after 72 h or beyond 20 per session; machine facts decayed after 90 d unused; backups 14 × 6 h | curator settings, `BACKUP_*` |
+| Postgres autovacuum | scale factor 0.02 + fillfactor 90 on `fact`/`episode` (schema 004) | keeps recall's `last_seen` touch-updates HOT and bloat low |
+| bulk import | direct-SQL loads should drop the HNSW indexes, `COPY`, then `CREATE INDEX CONCURRENTLY` (`scripts/bench/seed.py --index-mode rebuild`) | in-place HNSW insert is ~100–200 rows/s on one core |
 
 ## 9. Troubleshooting
 
 | symptom | check | fix |
 |---|---|---|
-| `/health` 503 / `status: error` | `docker ps` shows `astoria-postgres` unhealthy; `docker logs astoria-postgres` | `docker compose up -d`; disk full on `/volume1`?; `pgdata/` permissions (owned by the image's postgres uid) |
-| `tei.ok: false`, `recall.health.degraded: true` | `curl -s http://192.168.1.134:8931/info` (model id must contain `nomic-embed`); `docker ps | grep memoryos-tei` | `docker compose -f /volume1/docker/memoryos/docker-compose.yml up -d tei`. New rows written meanwhile have `embedding=NULL`; the curator backfills within 15 min (or restart `astoria` to run it now). A **model mismatch** is refused on purpose (`embedding model mismatch` in the log) — never point Astoria at a different embedder without re-embedding everything |
-| `llm.saint: unreachable (...)` | expected **every night** (workstation off) and whenever SAINT is down | cognify falls to direct Anthropic if `ANTHROPIC_API_KEY` is set (`llm.fallback: true`); otherwise jobs back off until SAINT returns |
-| queue `failed`/`dead` with `last_error: llm unavailable: saint: …; anthropic: …` | both paths failed — key missing/invalid, outage, or `LLM_TIMEOUT_S` too low | fix the key in `.env` → `deploy.sh --no-build`; then replay dead rows (§5) |
-| `last_error: extraction returned no valid JSON` | model returned prose twice | usually transient; if persistent, check `ASTORIA_LLM_MODEL` still resolves on SAINT (`curl http://192.168.1.221:4000/v1/models`) |
-| queue `pending` grows, log never says `acquired leader lock 43` | someone else holds the advisory lock: `docker exec astoria-postgres psql -U astoria -d astoria -c "SELECT pid, application_name, client_addr, state FROM pg_stat_activity WHERE pid IN (SELECT pid FROM pg_locks WHERE locktype='advisory' AND objid=43)"` | stop the other holder (a second `astoria` instance, or a dev process pointed at the NAS DB) or `SELECT pg_terminate_backend(<pid>)`; the lock is session-scoped and frees when its connection closes |
-| worker loop crashed (`worker loop crashed; API keeps serving`) | `docker logs astoria` traceback | `docker compose restart astoria` |
-| MCP client can't connect | URL must end with `/mcp/`; `curl -s http://192.168.1.134:8933/` shows `"mcp": "/mcp/"`; `MCP endpoint disabled` in the log means FastMCP failed to import | rebuild (`deploy.sh`), check `fastmcp` pin (`>=2.3,<3`) |
-| a wrong fact keeps coming back | it is being re-extracted | `retract`/`forget` it (writes a tombstone); check `astoria audit` for `blocked_tombstone` entries to confirm the guard is firing |
-| `action: "historical"` when you expected a supersede | the new statement's `asserted_at` is older than the active row's (only possible from the store/resolver, or a back-dated episode `occurred_at`) | assert it again now (explicit `remember`) |
-| `detector.action: "error"` in a capture response | detector hit a DB error (e.g. bad cardinality) — the episode was still stored | read `detector.error`; the fact can be asserted explicitly |
-| backups stopped (`backup FAILED`) | `docker logs astoria-backup`; `df -h /volume1` | disk; password changed in `.env` without recreating the sidecar (`deploy.sh --no-build`) |
+| `/health` 503, `status: error` | `docker compose ps` (database unhealthy), `docker logs astoria-postgres`, disk full, `pgdata/` permissions | `docker compose up -d`; free disk; fix ownership (the image's postgres uid) |
+| `tei.ok: false`, `recall.health.degraded: true` | `/health.tei.endpoints[].error`; `curl <endpoint>/info` or `/v1/models` — the served model must mention `nomic-embed` and return 768-d vectors | start/repair the embedder; rows written meanwhile carry `embedding NULL` and are backfilled on the next tick. A **model mismatch is refused on purpose** — never point Astoria at a different embedder without re-embedding everything |
+| one endpoint `usable:false` with `canary cosine … DIFFERENT vector space` | that URL serves a model whose vectors do not match the first verified endpoint | fix the model behind it (same model + same normalisation); it is retried after 10 min |
+| `llm.saint: unreachable (...)` | primary gateway down | expected when the gateway host is off; cognify uses Anthropic if `ANTHROPIC_API_KEY` is set (`llm.fallback: true`), else jobs back off until it returns |
+| queue rows `failed`/`dead` with `last_error: llm unavailable: saint: …; anthropic: …` | both LLM routes failed — key missing/invalid, outage, `ASTORIA_LLM_TIMEOUT_S` too low | fix `.env` → recreate the service → replay dead rows (§4) |
+| `last_error: extraction returned no valid JSON` | the model answered prose twice | usually transient; if persistent check that `ASTORIA_LLM_MODEL` still resolves on the gateway (`GET <llm_url>/models`) |
+| `queue.pending` grows; log never says `acquired leader lock 43` | another process holds the advisory lock (§4 query) | stop the other holder or `SELECT pg_terminate_backend(<pid>)`; the lock frees when its connection closes |
+| `worker loop crashed; API keeps serving` | traceback in `docker logs astoria` | `docker compose restart astoria` |
+| MCP client cannot connect | URL must end with `/mcp/`; `GET /` shows `"mcp": "/mcp/"`; `MCP endpoint disabled` in the log = FastMCP failed to import | rebuild; check the `fastmcp>=2.3,<3` pin |
+| `401 … requires a client token` | `ASTORIA_REQUIRE_TOKEN=true` and the client sent no valid bearer token | give the client a token from `ASTORIA_CLIENT_TOKENS` (or set `REQUIRE_TOKEN=false` on a trusted network) |
+| a wrong fact keeps coming back | it is being re-extracted from old episodes | `retract`/`forget` it (writes a tombstone); `astoria audit` shows `blocked_tombstone` when the guard fires |
+| an extracted value did not replace a human-stated one | trust guard: it is in `staging` with `meta.conflict_with` (`conflict_staged` in the audit) | `astoria staging` → `astoria approve <id>` if it is right |
+| `action: "historical"` when you expected a supersede | the statement's `asserted_at` is older than the active row's (back-dated `asserted_at`, or an old episode `occurred_at` through cognify/import) | assert it again now (explicit `remember` / `POST /facts` without `asserted_at`) |
+| `detector.action: "error"` in a capture response | the detector hit a store error; the episode was stored | read `detector.error`; assert the fact explicitly |
+| recall returns few vector candidates for a user who is a small share of a big index | `hnsw.iterative_scan` not in effect (pgvector < 0.8) | use pgvector ≥ 0.8 (the `pgvector/pgvector:pg18` image does) |
+| `rerank.status: down` | reranker container / endpoint unreachable; `GET <rerank_url>/info` | restart it or set `ASTORIA_RERANK_URLS=` to turn the stage off explicitly |
+| backups stopped (`backup FAILED`) | `docker logs astoria-backup`, disk space, password changed in `.env` without recreating the sidecar | free disk; `docker compose up -d astoria-backup` |
+| hard delete / user wipe is slow | schema 002 indexes missing (very old database) | restart the service (migrations apply) |
 
-## 10. Capacity knobs
-
-| knob | default | where |
-|---|---|---|
-| service memory | 768 MB | compose `mem_limit` (`astoria`) |
-| Postgres memory | 1 GB limit, `shared_buffers=256MB`, `maintenance_work_mem=128MB`, `shm_size` 256 MB | compose `astoria-postgres` |
-| DB pool | `ASTORIA_DB_POOL_MIN/MAX` 1/8 | `.env` |
-| uvicorn workers | 1 (by design: the in-process worker + advisory lock) | Dockerfile CMD |
-| cognify | `ASTORIA_COGNIFY_BATCH` 4 jobs/tick, tick 30 s, ≤ 8 episodes / 6 000 chars per LLM call, `LLM_TIMEOUT_S` 120 | `.env` / `worker.py` |
-| embeddings | TEI batch 8, `EMBED_MAX_CHARS` 6000, `EMBED_TIMEOUT_S` 20; backfill 200 facts + 200 episodes / 15 min | `.env` / `embed.py` / `maintenance.py` |
-| recall | top-40 ⊕ 40 facts, 20 ⊕ 20 episodes, `hnsw.ef_search=64`, `RECALL_MIN_COSINE` 0.48, `max_tokens` ≤ 20000, `limit` ≤ 200 | `recall.py` / request |
-| retention | snapshots 90 d, working turns archived after 14 d, backups 14 × 6 h | `maintenance.py` / `.env` |
-| TEI (`memoryos-tei`) | `--max-batch-tokens 2048 --max-client-batch-size 8 --max-concurrent-requests 64`, `mem_limit 3g` | `/volume1/docker/memoryos/docker-compose.yml` (the 7 GiB NAS OOM-loops on the default warmup) |
-
-Measured throughput/latency and the 10k-fact benchmark: [PERFORMANCE.md](PERFORMANCE.md)
-(`scripts/bench/`, acceptance T7).
-
-## 11. Tests
+## 10. Tests
 
 ```bash
-cd ~/repos/astoria && . .venv/bin/activate
-docker start astoria-dev-pg 2>/dev/null || true          # dev DB on 127.0.0.1:55432 (default ASTORIA_DB_DSN)
-uvicorn astoria.api.app:app --port 8977 &                 # API tests default to ASTORIA_URL=http://127.0.0.1:8977
-pytest                                                    # unit + concurrency (store-level) + API tests (skip when the API/DB is down)
-ASTORIA_URL=http://192.168.1.134:8933 pytest tests/test_acceptance.py -m "not slow"   # T1–T12 against the NAS (throwaway users)
-ASTORIA_URL=http://192.168.1.134:8933 pytest tests/test_acceptance.py -m slow -k t7   # 10k-fact scale test
-pytest -m llm                                             # tests that make a real LLM call
-scripts/smoke.sh                                          # 5-second post-deploy check
+. .venv/bin/activate
+# store-level + concurrency tests need a Postgres with pgvector (default ASTORIA_DB_DSN is a local dev DB on 55432)
+pytest                                                             # unit + concurrency + API (API tests skip when no service)
+uvicorn astoria.api.app:app --port 8977 &                           # API tests default to ASTORIA_URL=http://127.0.0.1:8977
+ASTORIA_URL=http://nas.local:8933 pytest tests/test_acceptance.py -m "not slow"   # T1–T12 against a live service (throwaway users)
+ASTORIA_URL=http://nas.local:8933 ASTORIA_RUN_SLOW=1 pytest tests/test_acceptance.py -k t7   # 10k-fact recall p95
+pytest -m llm                                                      # tests that make a real LLM call
+ASTORIA_URL=http://nas.local:8933 scripts/smoke.sh                 # post-deploy check
 ```
-Acceptance tests skip when `/health` is unreachable and fall back to API-only variants when they cannot
-reach the service's DB directly.
 
-## Addendum 2026-08-22 (post scale validation)
-
-- **Embedding endpoints are prioritized** (`ASTORIA_EMBED_URLS="url|model,url|model"`, default: workstation
-  nomic seat via SAINT `http://192.168.1.221:4000|saint-local-embed` → NAS TEI `http://192.168.1.134:8931|nomic`).
-  Each endpoint is verified (served model mentions nomic; canary vector-space check cosine ≥ 0.98 against the
-  first verified endpoint) and cooled down 60 s on failure, so the workstation is picked up within a minute of
-  power-on and the NAS TEI carries the night. `/health.tei` shows `active` + per-endpoint status. The workstation
-  seat is ~4× faster (≈64 ms vs ≈280 ms per query) — see `docs/PERFORMANCE.md` for why that matters.
-- **Schema 002** adds indexes on `fact.supersedes` / `fact.superseded_by` — mass delete/forget/wipe depends on
-  them (100k-row wipe: 17+ min → 7 s). Applied automatically at service start.
-- **`hnsw.iterative_scan=relaxed_order`** is set per recall so a user with a small share of the index still gets
-  full vector candidates (filtered-HNSW starvation fix).
-- Supersede path embeds **before** the per-key advisory lock (concurrent corrections on one key no longer
-  serialise on the embedder).
+The acceptance suite (`tests/test_acceptance.py`) is the behavioural contract: T1 correction propagates
+(and the detector path), T2 edit/delete + tombstone, T3 valid/belief time travel and back-dated
+corrections, T4 cross-client provenance, T5 provenance fields, T6 capture durable without an LLM + gate,
+T7 scale, T8 set predicates, T9 idempotency, T10 staging + approve, T11 out-of-order assertions and
+belief axis at the store, T12 compatibility routes, plus health, wipe, briefing/profile, audit,
+forget-by-query and predicate flips. `tests/test_belief_axis.py` pins the versioned supersede (original
+belief-closed, copy carries `valid_to`, `history` hides the original, `as_believed_at` answers the past).
+Every test uses a throwaway `user_id` and wipes it.

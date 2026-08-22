@@ -1,366 +1,422 @@
 # Astoria — architecture
 
-How the memory service is built and why it behaves the way it does. The interface contract is
-[CONTRACT.md](CONTRACT.md); operating it is [OPERATIONS.md](OPERATIONS.md); the HTTP/MCP surface is
-[API.md](API.md); numbers are in [PERFORMANCE.md](PERFORMANCE.md). Design rationale and the expert
-reviews that shaped it live in `~/projects/infrastructure/astoria/DESIGN.md` (§1, §4, §16, §17).
-
-Astoria is **live** on the NAS since 2026-08-22 (`http://192.168.1.134:8933`, MCP at `/mcp/`) and
-replaces MemoryOS (and, on the workstation, Turnstone and Hermes as memory surfaces).
-
----
+Astoria is a memory service for AI agents and the humans who work with them: a network service (REST +
+MCP) in front of Postgres + pgvector that stores **episodes** (raw, non-lossy captures) and **facts**
+(`subject, predicate, value` triples with two time axes, assertion order, cardinality, provenance and
+trust), lifts facts out of episodes with an LLM **at write time**, and answers **recall** with an LLM-free
+hybrid search that returns a pre-rendered context block. This document describes the components, the
+data model, the write and read paths, the trust model, the background workers, the degrade behaviour and
+the honest limits of the current code. Configuration knobs are in [CONFIGURATION.md](CONFIGURATION.md);
+the API in [API.md](API.md); the developer-facing interface summary in [CONTRACT.md](CONTRACT.md).
 
 ## 1. Shape in one picture
 
 ```
-                 input · Claude Code hooks/MCP · MegaPlan · astoria CLI · Nova (future)
-                                  │  REST :8933   │  MCP streamable-HTTP /mcp/
-                                  ▼               ▼
- ┌──────────────────────────── astoria (one uvicorn process, container `astoria`) ───────────────────────────┐
- │  api/rest.py  ──┐                                                                                         │
- │  api/mcp_tools  ├──► api/service.do_action()  ── the ONE dispatcher (auth → txn → store → JSON)           │
- │  api/app.py   ──┘          │                                                                              │
- │                            ├─ control plane (NO LLM): facts.upsert/retract/forget/update/approve/as_of    │
- │                            ├─ capture (NO LLM): gate → episode → regex detector → cognify queue           │
- │                            └─ recall (NO LLM): pgvector cosine ⊕ BM25 → RRF → weights → budget → context  │
- │  cognify/worker.py  (asyncio task, single leader via pg_try_advisory_lock(43))                            │
- │        every 30 s: drain queue → resolver.extract (LLM) → resolver.apply (facts.* again, deterministic)   │
- │        +15 min embed backfill · +6 h profile re-derive · +24 h snapshot prune / turn archive             │
- └───────────────┬──────────────────────────────┬──────────────────────────────┬───────────────────────────┘
-                 │ psycopg pool                 │ HTTP                         │ HTTP (write path only)
-                 ▼                              ▼                              ▼
-   astoria-postgres (pgvector/pgvector:pg18)   memoryos-tei :8931          SAINT :4000 (workstation, off
-   127.0.0.1:8934 on the NAS only              nomic-embed-text-v1.5       nightly) → fallback: direct
-   fact · episode · tombstone · predicate ·    768-d, pinned              Anthropic (claude-sonnet-4-6)
-   profile(+history) · snapshot · cognify_queue · audit · schema_migrations
-                 ▲
-   astoria-backup sidecar: pg_dump -Fc every 6 h, keep 14 → /volume1/docker/astoria/backups
+clients ── REST :8933 ─┐                      ┌─ embeddings: nomic-embed-text-v1.5 (768-d), any OpenAI-compatible
+           MCP  /mcp/ ─┤                      │   endpoint, prioritised list, verified vector space
+           CLI         │                      ├─ reranker (optional): TEI cross-encoder, POST /rerank
+                       ▼                      ├─ LLM (write path only): OpenAI-compatible gateway → Anthropic fallback
+        ┌──────────────────────────────┐      │
+        │ astoria (one uvicorn process)│◄─────┘
+        │  api/     rest · mcp_tools   │
+        │           service (dispatch) │      ┌──────────────────────────────────────────────────────┐
+        │  core/    capture · embed    │      │ Postgres + pgvector                                   │
+        │           llm · rerank       │◄────►│  fact · episode · predicate · tombstone · profile(_history)
+        │  store/   facts · episodes   │      │  snapshot · cognify_queue · audit                      │
+        │           graph · db         │      │  entity · alias · edge                (graph layer)    │
+        │  retrieval/ recall · graph   │      └──────────────────────────────────────────────────────┘
+        │  cognify/ resolver · targets │
+        │           worker (leader)    │
+        │  curator/ maintenance        │
+        └──────────────────────────────┘
 ```
 
-Three invariants fall out of this shape:
-
-1. **LLM only at write, never at read.** `recall`, `briefing`, every CRUD op and every compat route are
-   pure SQL + one embedding call. The LLM is consulted only by the background cognify worker, and even
-   then it only *proposes* triples — `facts.upsert_fact` / `facts.retract` decide.
-2. **Episodes first, durably.** `capture` writes the raw episode and returns; extraction is a queued job.
-   Nothing the user said is lost when SAINT, the cloud or TEI is down.
-3. **One dispatcher.** REST routes, `/op`, and every MCP tool call `service.do_action(action, params,
-   client)`. The two surfaces cannot drift; the caller identity resolved once becomes the fact `source`
-   and the audit `actor`.
+One process hosts everything: FastAPI routes, the FastMCP streamable-HTTP app mounted at `/mcp/`, and an
+asyncio task running the worker loop. Every REST route and every MCP tool call the same dispatcher
+(`api/service.do_action`), so the two surfaces cannot drift.
 
 ## 2. Layers (what is stored where)
 
-| layer | storage | what it holds | recalled how |
-|---|---|---|---|
-| working | `episode.kind='turn'` keyed by `session_id` | the live session's raw turns (`User:`/`Assistant:` body, `meta.user_input/agent_response`) | last 4 turns of the given `session_id`, **prepended** to recall as `working`, never searched |
-| episodic | `episode.kind ∈ {summary, note, import}` (+ other sessions' `turn`s) | session summaries, free notes, imports | hybrid search, ≤ 3 per recall, rendered as "from a past session (DATE)" |
-| semantic | `fact.layer='semantic'` | `(subject, predicate, value)` about the world: tools, hardware, projects, decisions | hybrid search |
-| profile | `fact.layer='profile'` (subject == user_id and predicate `layer_hint=profile`) | identity, preferences, traits | hybrid search; all of them in `/briefing` and `/profile`; recency weight = 1 (never decays) |
-| procedural | `fact.layer='procedural'` | how-tos (`learned_howto`), may carry `ref {kind: skill|megaplan|infra-doc|url, ref}` | hybrid search; recency weight = 1 |
-
-The **profile narrative** (`profile.narrative`) is a *display-only* dual of the profile facts: a
-deterministic template rendered by the curator (`curator.render_profile_narrative`), versioned in
-`profile_history`, never embedded or searched — so a bad rewrite can never poison recall.
+| layer | storage | content |
+|---|---|---|
+| working | `episode.kind='turn'` per `session_id` | the live session's last turns; prepended to recall as `working`, never searched |
+| episodic | `episode.kind in (summary, note, import)` (+ `turn` of *other* sessions) | "what happened": summaries, notes, imports, past turns |
+| semantic | `fact.layer='semantic'` | "what is true": facts about the user's world, projects, decisions |
+| profile | `fact.layer='profile'` (subject == user) + `profile.narrative` | durable facts about the user themself; narrative is a display-only dual |
+| procedural | `fact.layer='procedural'` | how-tos; may carry a `ref` (`{kind, ref}`) to a skill, plan or document |
+| graph | `entity`, `alias`, `edge` | typed links between facts and entities; subject aliases |
 
 ## 3. Data model
 
-Schema: [`astoria/sql/001_schema.sql`](../astoria/sql/001_schema.sql) (applied idempotently at boot,
-recorded in `schema_migrations`). Postgres 18 + pgvector 0.8.x + pgcrypto.
+Schema files live in `astoria/sql/` and are applied in lexical order at start-up, each recording itself
+in `schema_migrations` (re-running is a no-op):
 
-### 3.1 `fact` — the heart
+| file | adds |
+|---|---|
+| `001_schema.sql` | `predicate`, `episode`, `fact`, `tombstone`, `profile`, `profile_history`, `snapshot`, `cognify_queue`, `audit`, seed predicate vocabulary |
+| `002_chain_indexes.sql` | partial b-tree indexes on `fact.supersedes` / `fact.superseded_by` (without them every hard delete scanned the table; a 100 k-row wipe went from 17+ min to 7 s) |
+| `003_graph_aliases.sql` | `entity`, `alias`, `edge` |
+| `004_pg_tuning.sql` | `autovacuum_*_scale_factor = 0.02` and `fillfactor = 90` on `fact` / `episode`; `0.05` on `cognify_queue` / `snapshot` |
 
-```
-(id, user_id, subject, predicate, cardinality, value, value_norm*, hook, detail, embedding vector(768), tsv*, layer,
- valid_from, valid_to,            -- VALID time: when it was true in the world
- asserted_at,                     -- ASSERTION time: orders statements (newer statement wins)
- ingested_at, expired_at,         -- BELIEF/transaction time: when WE believed it
- status ∈ {active, superseded, retracted, archived, staging, deleted},
- supersedes → fact, superseded_by → fact   (DEFERRABLE INITIALLY DEFERRED),
- confidence, source, source_kind ∈ {explicit, detector, extracted, imported, curator}, source_trust, is_belief,
- importance, last_seen, access_count, corroborations, tags[], origin_episode → episode, evidence, ref jsonb, meta jsonb)
- * generated columns: value_norm = lower(btrim(collapse-ws(value))); tsv = to_tsvector(subject + predicate words + value)
-```
+### 3.1 `fact`
 
-Key facts about facts:
+| group | columns | notes |
+|---|---|---|
+| identity | `id uuid`, `user_id`, `subject`, `predicate → predicate(name)`, `cardinality` (denormalised at write), `value`, `value_norm` (generated: lower-cased, whitespace-collapsed), `hook` (`"subject predicate words: value"` — what is embedded and searched), `detail`, `layer` | subject is canonical (lower-case, ≤ 64 chars; first-person forms and the user's own id map to `user_id`; aliases resolve to their canonical name) |
+| search | `embedding vector(768)`, `tsv` (generated tsvector over subject + predicate words + value) | HNSW cosine index + GIN |
+| valid time | `valid_from`, `valid_to` | when the fact was/is true in the world |
+| assertion time | `asserted_at` | when the statement was made — **the ordering axis** (newer statement wins) |
+| belief time | `ingested_at`, `expired_at` | when *we* believed it (transaction time) |
+| state | `status ∈ {active, superseded, retracted, archived, staging, deleted}`, `supersedes`, `superseded_by` (self-FKs, deferrable) | the supersede chain |
+| trust | `confidence` (0–1), `source` (client name), `source_kind ∈ {explicit, detector, extracted, imported, curator}`, `source_trust`, `is_belief`, `corroborations` | see §6 |
+| usage | `importance`, `last_seen`, `access_count` | ranking and decay inputs |
+| lineage | `origin_episode → episode(id)`, `evidence` (verbatim snippet), `ref` (procedural link), `tags`, `meta` | `meta` carries `cognify`, `conflict_with`, `version_of`, `belief_closed_by`, `merged_from`, `archived_reason`, `resolved`, … |
 
-- **`hook`** = `"subject predicate words: value"` — the string that is embedded, BM25-indexed and
-  rendered. `detail` is free text that is not searched.
-- **Subject canonicalization** (`facts.canon_subject`): `I / me / my / myself / user / the user / owner /
-  self / you / rick` (and the literal user_id) → the `user_id`; anything else lower-cased, ≤ 64 chars.
-  **Predicates** (`canon_predicate`) → `snake_case`, `[a-z0-9_]`, ≤ 64, default `fact`.
-- **Three time axes** (the bitemporal model, plus assertion order):
-  - *valid* (`valid_from`, `valid_to`): the real-world window. `valid_from` defaults to `asserted_at`.
-  - *asserted* (`asserted_at`): when the statement was made. **This is the ordering axis** — a newer
-    statement supersedes an older one *even if it back-dates its validity* ("I've preferred IPA since
-    June" stated in August beats a July "Guinness"). An older-asserted statement arriving late (queue
-    reorder, replay) is stored as history and cannot clobber the active row. The REST API cannot set
-    `asserted_at` on insert (it is `now()`); only the store/resolver back-dates it to the episode's
-    `occurred_at`.
-  - *belief* (`ingested_at`, `expired_at`): when the system started / stopped believing the row.
-    Retract/forget/supersede stamp `expired_at`.
-- **Cardinality** is denormalized onto the row from the `predicate` registry at write time and enforced
-  by two partial unique indexes: at most **one active row per `(user, subject, predicate)`** for
-  `functional` keys; at most **one active row per `(user, subject, predicate, value_norm)`** for `set`
-  keys. `functional` = one current value (`favorite_beer`, `location`, `default_model`) → a new value
-  *supersedes*; `set` = many values coexist (`likes`, `uses_tool`, `owns_hardware`) → add members,
-  `retract` removes one. Unknown predicates auto-register (`predicate.auto=true`): functional iff prefix
-  `favorite_|default_|primary_|preferred_|current_` or suffix `_is|_name`, else `set` (the safe guess —
-  never clobbers by accident). `PATCH /predicates/{name}` fixes a wrong guess and clears `auto`.
-- **Status lifecycle**
-  - `active` — current belief, recalled.
-  - `staging` — low-confidence non-explicit extraction (confidence < 0.35); listed, not recalled;
-    `approve` promotes it through the normal supersede path.
-  - `superseded` — closed by a newer value (`superseded_by` set, `valid_to` closed, `expired_at` set) or
-    stored as explicit history (`historical=true` / a past `valid_to`).
-  - `retracted` — "we no longer believe this"; `expired_at` set, `valid_to` untouched.
-  - `archived` — soft-forgotten (hidden from recall, still auditable) or an aged-out turn.
-  - `deleted` — reserved; hard forget actually `DELETE`s the row.
-- **Trust numbers** (bounded heuristics for *ranking*, never the conflict resolver — assertion order is):
+Two partial unique indexes are the invariant the whole store is built around: **exactly one `active` row
+per functional key** `(user_id, subject, predicate)` and **one `active` row per set value**
+`(user_id, subject, predicate, value_norm)`.
 
-  | | |
-  |---|---|
-  | `confidence` default by `source_kind` | explicit **.90** · detector **.80** · extracted = LLM value clamped **[.30, .85]** · imported **.45** · curator **.50** (clamped to `[0.05, 0.98]`) |
-  | corroboration | an *independent* re-assert (different `origin_episode` **and** different client) bumps `corroborations` and `conf = 1 − (1 − conf)·0.6` (saturating); same-source repeats only bump `last_seen`/`access_count` |
-  | client trust cap (`CLIENT_TRUST`) | cli 1.0 · human 1.0 · input .85 · claude-code .85 · api .7 · mcp .7 · megaplan .6 · curator .5 · anonymous .5 · import .4 · unknown names .6 |
-  | kind trust cap (`KIND_TRUST`) | explicit 1.0 · detector .9 · extracted .75 · curator .5 · imported .45 |
-  | `source_trust` | `min(CLIENT_TRUST[source], KIND_TRUST[source_kind], confidence)` |
-  | staging gate | `source_kind ∈ {extracted, imported, curator}` and confidence < **0.35** → `status='staging'` |
-  | recall weight | `trust = confidence × source_trust` (one of four equal-weight terms, see §5) |
+### 3.2 The three time axes and belief-axis versioning
 
-### 3.2 `tombstone` — the resurrection guard
+- **Valid time** (`valid_from`/`valid_to`) shapes the validity window and nothing else. A fact asserted
+  with a `valid_to` in the past is recorded as history (`status='superseded'`, action `historical`) and
+  never disturbs the current value.
+- **Assertion time** (`asserted_at`) decides conflicts on a functional key: the newer *statement* wins,
+  even when it back-dates its validity ("since June it has been X"). An older statement arriving later
+  (a delayed queue item, a replayed export) cannot clobber the current value — it is stored as history
+  closed at the active row's start.
+- **Belief time** (`ingested_at`/`expired_at`) records what the system believed when. Retraction closes
+  the belief axis (`expired_at=now`) and leaves `valid_to` alone.
 
-`(user_id, subject, predicate, value_norm) → reason, by_source, blocks ∈ {non-explicit, none}`.
-A human **retract** (explicit or detector), **forget** (soft or hard) or delete writes a tombstone with
-`blocks='non-explicit'`. `upsert_fact` checks it first: a non-explicit write (extracted / imported /
-curator) of the same triple is **blocked** (`action: "blocked"`, audited as `blocked_tombstone`) — this is
-what stops an old conversation from re-extracting "Guinness" after you corrected it. An **explicit**
-re-assert lifts the tombstone. Retracts proposed by the LLM (`source_kind=extracted`) write
-`blocks='none'` — they never block a human.
+Supersession is **bitemporal** (this follows the supersede-don't-delete, bitemporal edge model of
+Graphiti): when a new value supersedes an active functional row, the store
 
-### 3.3 `episode` — non-lossy raw captures
+1. inserts a **closed copy** of the old row (same identity, `valid_from`, `asserted_at`, embedding;
+   `valid_to = max(old.valid_from, new.valid_from)`, `status='superseded'`, `superseded_by=new`,
+   `meta.version_of=old.id`) — this copy is the *current belief* about the past, and it is what the new
+   row's `supersedes` points at;
+2. closes the **original** on the belief axis only (`expired_at=now`, `status='superseded'`,
+   `superseded_by=new`, `meta.belief_closed_by=copy.id`) — its `valid_to` stays as it was believed.
 
-`(id, user_id, kind ∈ {turn, summary, note, import}, hook (≤ 400 chars — what is embedded), body, embedding,
-tsv*, occurred_at, ingested_at, source, session_id, importance, access_count, last_seen, status ∈ {active,
-archived, deleted}, processed_at, idem_key UNIQUE, tags[], meta)`.
-`body` is the text, or `"User: …\nAssistant: …"` for a turn (also kept in `meta.user_input/agent_response`).
-`idem_key = sha256(user_id|session_id|kind|body)` makes re-sending the same content a no-op
-(`deduped: true`, no second cognify job). `processed_at` is stamped when cognify finishes.
+Consequently `as_of(at)` (current belief) returns the copy for past instants and the new row for now,
+while `as_of(at, as_believed_at=B)` with `B` before the correction still returns the original — "what did
+we believe at B". `history` hides belief-closed originals (rows with `meta.belief_closed_by`) so a chain
+reads as one entry per statement; `include_expired` shows them.
 
-### 3.4 Supporting tables
+### 3.3 `predicate` — cardinality registry
 
-- `predicate` — the registry (name, cardinality, layer_hint, auto, description); 30 seeded names.
-- `profile` / `profile_history` — narrative, version, `rederived_at`, `source ∈ {template, llm}` (v1 only writes `template`).
-- `snapshot` — one row per recall: `(user_id, session_id, client, query, fact_ids[], episode_ids[])`, pruned after 90 days. "What was this session shown?"
-- `cognify_queue` — `(episode_id, session_id, kind ∈ {extract, rederive_profile, embed_backfill}, priority (1 = corrections first, 5 normal), state ∈ {pending, running, done, failed, dead, skipped}, attempts, max_attempts=5, next_attempt_at, last_error, payload)`.
-- `audit` — append-only: every control-plane mutation `(user_id, actor, op, target, detail)`; ops include `inserted | superseded | noop | historical | staging | blocked_tombstone | retract | forget_soft | forget_hard | update | approve | episode_delete | predicate_update | user_wipe`.
-- `schema_migrations` — applied SQL versions.
+`name` (PK), `cardinality ∈ {functional, set}`, `layer_hint ∈ {semantic, profile, procedural}`, `auto`
+(registered by an extractor — review it), `description`. Unknown predicates auto-register:
+**functional** only for the prefixes `favorite_ default_ primary_ preferred_ current_` or the suffixes
+`_is _name`; everything else is a **set** (guessing "set" can never clobber a value). The seed vocabulary
+includes `name, location, timezone, employer, role, favorite_*, preferred_*, primary_*, default_*,
+current_focus` (functional) and `likes, dislikes, interested_in, has_skill, knows_person, uses_tool,
+owns_hardware, runs_service, works_on_project, goal, decided, fact, learned_howto, related_to` (set); edit
+it through `PATCH /predicates/{name}`.
+
+### 3.4 `tombstone` — the resurrection guard
+
+`(user_id, subject, predicate, value_norm)` → `reason`, `by_source`, `blocks ∈ {non-explicit, none}`. A
+human-initiated `retract`, `forget` or `delete` writes a tombstone with `blocks='non-explicit'`; any later
+**non-explicit** write of that triple (extractor, import, curator) is refused (`action: blocked`, audit
+`blocked_tombstone`). An **explicit** re-assert lifts it. Retractions made by the extractor itself or the
+curator write `blocks='none'` — they are recorded but do not block. Tombstones address a failure mode
+common to systems that re-extract facts from conversation history: a fact the user retracted comes back
+because an old transcript still mentions it.
+
+### 3.5 `episode`
+
+`kind ∈ {turn, summary, note, import}`, `hook` (≤ 400 chars, what is embedded), `body`, `embedding`, `tsv`
+(over hook + body), `occurred_at`, `ingested_at`, `source`, `session_id`, `importance`, `access_count`,
+`last_seen`, `status ∈ {active, archived, deleted}`, `processed_at` (cognify done), `idem_key`
+(`sha256(user_id|session_id|kind|body)` — a replayed capture returns the existing row with `deduped=true`),
+`tags`, `meta` (turns keep `user_input` / `agent_response` here).
+
+### 3.6 Graph layer
+
+- `entity (user_id, name)` — canonical lower-case name (same spelling as `fact.subject`), free-form
+  `kind`, `summary`. Auto-registered when an edge or alias names it.
+- `alias (user_id, alias) → canonical` — flat (no chains): adding `a → b` when `b` is itself an alias of
+  `c` stores `a → c`, and anything that pointed at `a` is re-pointed to `c`. Every subject-taking store
+  operation canonicalises through the alias table, so a write or read on an alias lands on the canonical
+  subject. The user id itself cannot be aliased.
+- `edge` — `src_kind/src_id`, `dst_kind/dst_id` (kind ∈ `{fact, entity}`; fact ids are uuids, entity ids
+  are names), `relation` (snake_case), `weight`, the same valid/assertion axes, `status ∈ {active,
+  superseded, retracted, archived}`, `source`, `source_kind`, `confidence`, `origin_episode`, `evidence`,
+  `meta`. One **active** edge per `(src, dst, relation)`; a re-assert bumps `asserted_at`, keeps the max
+  weight/confidence, corroborates when it comes from a different episode *and* client. No FK to `fact` on
+  purpose: hard-deleted facts leave dangling edges that readers filter.
+
+### 3.7 Supporting tables
+
+`profile` (one narrative per user, `version`, `rederived_at`, `source ∈ {template, llm}`) +
+`profile_history`; `snapshot` (which fact/episode ids a recall returned, per session/client/query — ids
+only, pruned after 90 days); `cognify_queue` (see §5); `audit` (append-only log of every control-plane
+mutation: `actor`, `op`, `target`, `detail`).
 
 ## 4. Write path
 
-### 4.1 `capture` (no LLM; `astoria/core/capture.py`)
+### 4.1 `capture` (no LLM; `core/capture.py`)
 
 ```
-text (or user_input+agent_response)
-  → detect()   regex v1: /remember S P V · /correct S P V · /forget S P [V] ·
-               "my (favorite|default|preferred|primary|current) X is Y" · "I (live|am based) in Y" ·
-               "my name is Y" · "I (don't|no longer) (like|use|prefer) Y" · "I (like|love|enjoy) Y"
-               (a leading "actually" turns remember into correct)
-  → gate()     drop if: empty · starts with /word (unless the detector matched) · an ack
-               (ok/okay/done/y/n/yes/no/thanks/thank you/continue/k/sure) · < 8 chars      → {dropped: reason}
-  → episodes.add_episode()   embed hook via TEI (None if TEI down), idem_key dedupe
-  → detector apply (in a SAVEPOINT, so a failure can't poison the episode write):
-        remember/correct → facts.upsert_fact(source_kind='detector', confidence .80, origin_episode, evidence)
-        retract          → facts.retract(source_kind='detector')  (tries likes→uses_tool / uses_tool→likes)
-  → enqueue cognify (unless deduped or cognify=false): priority 1 if priority="high" or the text
-        contains a correction hint (actually / correction / i meant / instead / no longer / "not … anymore"), else 5
-  → {episode_id, deduped, dropped, detector, queued}
+text / turn ──► detect() ──► gate() ──► episode (idempotent) ──► detector apply ──► enqueue cognify
 ```
 
-Structured writes (`POST /facts`, `/correct`, MCP `remember`, CLI `remember`) skip all of this and go
-straight to `facts.upsert_fact(source_kind='explicit', confidence .90)`.
+1. **Detector first, gate second.** `detect()` recognises a small set of explicit memory statements
+   (`/remember S P V`, `/correct S P V`, `/forget S P [V]`, "my favorite X is Y", "I live in …", "my name
+   is …", "I don't use/like … (anymore)", "I like …"; an initial "actually" marks a correction). A match is
+   a memory operation even when it looks like a slash command, so it is never gated away.
+2. **Gate.** Anything else that is empty, a slash command, a one-word acknowledgement (`ok`, `done`, `y`,
+   …) or shorter than 8 characters is dropped (`dropped: <reason>`, no episode, no queue row).
+3. **Episode.** Written first and durably (`store/episodes.add_episode`). With the asynchronous write path
+   (`ASTORIA_EMBED_SYNC=false`, the default) the row carries `embedding NULL` and the request makes no
+   embedding call; `sync=true` embeds inline.
+4. **Detector apply.** Inside a savepoint (a detector failure never poisons the episode write): `remember`
+   / `correct` → `facts.upsert_fact(source_kind='detector', confidence .80)`; `retract` →
+   `facts.retract(source_kind='detector')` trying the alternate predicate (`likes` ↔ `uses_tool`) when the
+   first finds nothing.
+5. **Enqueue.** Unless `cognify=false` or the episode was a replay: one `cognify_queue` row, `priority 1`
+   when `priority="high"` or the text carries a correction hint ("actually", "correction", "instead",
+   "not … anymore", …), else `5`.
 
-### 4.2 The supersede transaction (`facts.upsert_fact`)
+### 4.2 The supersede transaction (`store/facts.upsert_fact`)
 
-Runs inside one DB transaction, serialized per key by `pg_advisory_xact_lock(hash(user|subject|predicate))`:
+Every fact write — explicit, detector, extractor, import, curator, resolver — goes through this one
+function, inside a transaction:
 
-1. canonicalize subject/predicate/value; compute `hook`, `value_norm`, confidence, `source_trust`;
-   `ensure_predicate` (auto-register / apply an explicit cardinality override).
-2. **tombstone guard** — explicit lifts it; non-explicit is `blocked`.
-3. load the active row for the key (functional) or for the key+value (set).
-4. **idempotent no-op** — same `value_norm` already active → bump `last_seen`, `access_count`,
-   corroborate if independent, upgrade `source_kind`/`source_trust` on an explicit re-assert,
-   `asserted_at = GREATEST(old, new)`; `action: "noop"`.
-5. **staging gate** (non-explicit, confidence < .35).
-6. **explicit history** (`historical=true` or a `valid_to` in the past) → insert as `superseded`,
-   touch nothing; `action: "historical"`.
-7. **assertion-order guard** — functional key and the new `asserted_at` is *older* than the active row's
-   → insert as `superseded` (closed at the active row's start); `action: "historical"`.
-8. otherwise **close then insert**: the old active functional row (and any `contradicts` ids named by the
-   resolver) get `status='superseded', valid_to = GREATEST(valid_from, new.valid_from), expired_at=now(),
-   superseded_by=new`; the new row is inserted with `supersedes=old` and embedded. `action: "superseded"`
-   or `"inserted"` (or `"staging"`).
-9. audit row.
+1. canonicalise subject (user aliases, alias table), predicate (snake_case), value (whitespace); derive
+   `hook`, `value_norm`, confidence (`KIND_CONF` default per `source_kind` unless given, clamped to
+   `[confidence_floor, confidence_cap]`), trust (§6), layer (`profile` when subject == user and the
+   predicate's `layer_hint` is `profile`, else the hint, else `semantic`);
+2. `ensure_predicate` (register or, when a cardinality is passed, update the registry);
+3. **embed before the lock** (a same-value re-assert is pre-checked without the lock and skips the
+   embedding); then `pg_advisory_xact_lock(hash(user_id|subject|predicate))` serialises writers on the key;
+4. **tombstone guard** — blocked unless `source_kind='explicit'` (which lifts the tombstone);
+5. **idempotency** — same `value_norm` already active → `noop`: bump `last_seen`/`access_count`, raise
+   `asserted_at` to the newer statement, upgrade `source_trust`/`source_kind` on an explicit re-assert,
+   and **corroborate** (`corroborations+1`, `confidence ← 1-(1-c)·0.6`, saturating at the cap) when the
+   re-assert comes from a different `origin_episode` *and* a different client;
+6. **staging gate** — `extracted` / `imported` / `curator` with confidence < `0.35` → `status='staging'`;
+7. **trust guard** (§6) — may downgrade to `staging` with `meta.conflict_with`;
+8. **history paths** — `historical=true` or a past `valid_to` → closed row, `action: historical`; a
+   functional statement **older** (by `asserted_at`) than the active one → closed row ending at the
+   active row's start, `action: historical`;
+9. **supersede** — for an active functional row, and for every row named in `contradicts` (any
+   cardinality, same user), the bitemporal close of §3.2; then insert the new row → `action:
+   superseded` (with the ids closed) or `inserted` / `staging`;
+10. one `audit` row per outcome (`inserted`, `superseded`, `noop`, `historical`, `staging`,
+    `conflict_staged`, `blocked_tombstone`).
 
-`retract` → `status='retracted', expired_at=now()` (valid window untouched) + tombstone.
-`forget` soft → `status='archived', expired_at` + tombstone; hard → `DELETE` + tombstone.
-`approve_staging` re-runs `upsert_fact` as explicit (so functional uniqueness is honoured) and archives
-the staging row. `update_fact` edits `value | confidence | importance | tags | layer | valid_from |
-valid_to | asserted_at | is_belief | ref | status (active|archived|staging) | evidence | detail` by id
-(re-embeds when the value changes).
+`retract` closes belief (`status='retracted'`, `expired_at=now`) for a fact id or a `(subject, predicate[,
+value])` key and tombstones each closed triple. `forget` archives (`soft`) or deletes (`hard`) one row and
+tombstones it. `update_fact` edits `value, confidence, importance, tags, layer, valid_from, valid_to,
+asserted_at, is_belief, ref, status (active|archived|staging), evidence, detail` by id and re-embeds when
+the value changed. `approve_staging` promotes a staging row through the normal supersede path as an
+explicit assertion (confidence ≥ 0.8) and archives the staging row.
 
-### 4.3 Cognify (LLM at write; `astoria/cognify/`)
-
-`worker.run_forever` (an asyncio task started in the app lifespan) ticks every **30 s**:
-
-- **Leader lock**: the loop only drains while it holds `pg_try_advisory_lock(43)` on a dedicated
-  autocommit connection — one drainer even if two containers were ever started.
-- **Claim**: up to `ASTORIA_COGNIFY_BATCH` (4) ready jobs (`pending|failed`, `next_attempt_at <= now()`)
-  ordered by `(priority, occurred_at)`, `FOR UPDATE SKIP LOCKED`, `state='running'`, `attempts+1`. Rows
-  stuck in `running` for > 30 min are reclaimed as `failed` (crash recovery).
-- **Coalesce** by `(user_id, session_id)`, splitting a group at 8 episodes / 6 000 chars (bodies are
-  truncated at 6 000 chars) — one LLM call per conversation chunk, not per turn.
-- **Extract** (`resolver.extract`): prompt [`prompts/extract.md`](../astoria/cognify/prompts/extract.md)
-  (Graphiti-shaped: reuse candidate ids, `contradicts`, dates only when stated) + job text with
-  timestamps + ≤ 30 candidate active facts (top-20 cosine + literal subject matches) + ≤ 60 registry
-  predicates. `llm.chat_json` → **SAINT** (`saint-cloud-medium`) first; on connection/HTTP failure →
-  **direct Anthropic** (`claude-sonnet-4-6`, needs `ANTHROPIC_API_KEY`). Output validated by pydantic
-  (`Extraction{summary, nothing_durable, facts[]}`), one repair retry on invalid JSON.
-- **Apply** (`resolver.apply`, same transaction as the queue update): each proposed fact → normalize →
-  `facts.upsert_fact(source_kind='extracted', confidence clamp [.3,.85], asserted_at=episode.occurred_at,
-  origin_episode, evidence, contradicts=…)` or `facts.retract(source_kind='extracted')`; for a functional
-  key whose active value is the same thing spelled differently (normalized-equal or value cosine ≥ .93)
-  the active spelling is kept so the write NOOPs/corroborates instead of flip-flopping; `summary` → a new
-  `episode(kind=summary, importance .6)`
-  and the source turns drop to importance .3; `episode.processed_at` stamped; queue rows `done` with a
-  result payload. A failure anywhere rolls the whole group back — **no half-applied jobs, no junk on LLM
-  error.**
-- **Backoff**: `failed` rows retry after 1, 5, 15, 60, 240 min; after `max_attempts` (5) → `dead`
-  (`finished_at` set, `last_error` kept). `/health.queue.dead` counts them; see OPERATIONS for replay.
-- Queue kinds `rederive_profile` / `embed_backfill` are routed to the curator instead of the LLM.
-
-### 4.4 Curator (no LLM; `astoria/curator/maintenance.py`) — on the same loop
-
-| job | cadence | what |
-|---|---|---|
-| `embed_backfill` | every 15 min | embed up to 200 facts + 200 episodes whose `embedding IS NULL` (after a TEI outage) |
-| `rederive_profile` | every 6 h | for users whose profile-layer facts changed since `profile.rederived_at`: re-render the template narrative; bump `version` + `profile_history` only if the text changed |
-| daily | every 24 h | `prune_snapshots` (> 90 d) · `archive_old_turns` (`kind='turn'` older than 14 d → `archived`) |
-
-Intervals are measured from process start (monotonic), so a restart runs backfill/profile on the first
-tick and the daily job ~24 h later.
-
-## 5. Read path (`astoria/retrieval/recall.py`) — no LLM
+### 4.3 Cognify (LLM at write; `cognify/`)
 
 ```
-query ─► embed_one("search_query: " + q)  (None if TEI down → BM25-only, health.degraded=true)
-      ─► candidates (per layer set, status='active', valid_to IS NULL or > now()):
-            facts:    top-40 cosine (HNSW, SET LOCAL hnsw.ef_search=64, cosine ≥ 0.48)  ⊕  top-40 BM25 (ts_rank_cd, OR-tsquery of the query words)
-            episodes: top-20 cosine ⊕ top-20 BM25 over summary/note/import/turn, excluding THIS session's turns
-      ─► RRF  score_rrf = Σ 1/(60 + rank)  over the lists an item appears in
-      ─► weight  score = rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)
-            recency = exp(−ln2 · age_days / half_life):  episodic 30 d · semantic 180 d · beliefs (is_belief) 60 d · profile/procedural ∞
-            trust   = confidence × source_trust   (episodes: fixed 0.6)
-      ─► collapse  one row per FUNCTIONAL (subject, predicate); all rows for SET keys
-      ─► budget    facts first, then ≤ 3 episodes; cost ≈ len(hook)/4 tokens ≤ max_tokens; ≤ limit items
-      ─► stale_hint  (functional facts only) a newer active episode mentions the predicate words (and the
-                     subject, unless it is the user) but NOT the current value → "· stale?" tag
-      ─► working   last 4 turns of session_id (if given), oldest→newest, prepended, never searched
-      ─► profile   (include_profile) narrative + active profile facts
-      ─► side effects: one snapshot row; access_count+1 / last_seen=now() on everything shown
-      ─► context   pre-rendered block every client injects verbatim
+queue ──claim (priority, occurred_at; SKIP LOCKED)──► coalesce per (user, session) ≤ 8 episodes / 6000 chars
+      ──► gather_context: ≤ 30 candidate active facts (top-20 cosine to the job text ∪ facts whose
+          non-user subject appears literally in it) + predicate registry (≤ 60)
+      ──► extract: ONE LLM call, strict JSON, pydantic-validated, one repair retry fed the error
+      ──► apply (deterministic, same transaction): aliases → facts → edges → summary episode → mark done
 ```
+
+The extractor prompt (`cognify/prompts/extract.md`; its shape — reuse known names, cite contradicted
+candidate ids, dates only when stated — is adapted from Graphiti's extraction prompts) returns
+`{summary, nothing_durable, facts[], edges[], aliases[]}`. Each fact is `{subject, predicate, value, layer,
+is_belief, confidence (clamped to [0.3, 0.85]), valid_from, valid_to, action: assert|retract, contradicts:
+[candidate ids], evidence}`.
+
+`apply` writes in this order, all through the store functions:
+
+- **aliases** first (`graph.add_alias`, `source_kind='extracted'`), so a rename stated in this text
+  canonicalises what follows;
+- **facts**: `retract` → `facts.retract(source_kind='extracted', reason='extracted-retract')` (never a
+  blanket retract of a whole set without a value); `assert` → for functional keys a **near-duplicate
+  guard** first (if the active value is the same thing spelled differently — normalised-equal or cosine ≥
+  0.93 between the *values* — reuse the active spelling so the upsert is a corroborating `noop` instead of
+  a flip-flop), then `facts.upsert_fact(source_kind='extracted', asserted_at=occurred_at, contradicts=…,
+  meta.cognify={episodes, session_id})`;
+- **edges**: endpoints are subject names (→ entity nodes) or `fact:N` (the N-th fact of this reply);
+  `graph.add_edge(source_kind='extracted')`;
+- **summary**: when the group contained turns and the model produced one, a `summary` episode
+  (idempotent on its text) embedded inline, importance 0.6; the summarised turns drop to importance 0.3;
+- every episode in the group gets `processed_at`; the queue rows are marked `done` with a result payload
+  **in the same transaction** — a failure anywhere rolls the whole group back and backs the rows off.
+
+### 4.4 Target resolver (LLM on demand; `cognify/targets.py`)
+
+The sibling of the regex detector for natural-language instructions the detector cannot parse ("forget
+the thing about Guinness", "actually I moved to Portland", "I don't use Emacs anymore"). `resolve` gathers
+≤ 30 candidate facts (hybrid search top-20 ∪ hook ILIKE any salient token ∪ the user's own functional
+facts), asks the LLM (`prompts/resolve.md`) for `{intent ∈ forget|retract|correct|remember|none, targets
+[ids ⊂ candidates], new_fact, confidence, explanation}`, validates it (target ids must be candidates;
+`correct`/`remember` need `new_fact`) with one repair retry, and returns the **plan without applying it**;
+`requires_confirmation` is false only for `remember`, `none`, or one target with confidence ≥ 0.85.
+`apply` executes a plan deterministically: `forget` → `facts.forget(soft)`, `retract` → `facts.retract`,
+`correct` → `upsert_fact(source_kind='explicit', contradicts=targets)`, `remember` → `upsert_fact`. It
+is reachable as `POST /resolve`, `POST /resolve/apply`, MCP `memory(action="resolve"|"resolve_apply")`
+and the CLI (`astoria resolve`, `astoria forget "<text>"`). It is never on the capture hot path.
+
+### 4.5 Curator (`curator/maintenance.py`, scheduled by the worker)
+
+| pass | cadence | LLM | what |
+|---|---|---|---|
+| `embed_backfill` | every tick (30 s) before the drain | no | embeds up to 200 facts + 200 episodes with `embedding NULL` (batches of 8) — the other half of the asynchronous write path |
+| `rederive_profile` | hourly group, for users whose profile-layer facts changed since the last derive | optional (`ASTORIA_PROFILE_LLM`) | rebuilds `profile.narrative` from active profile facts; LLM narrative (sanity-checked: ≥ 80 % of values mentioned, ≤ 2500 chars) or deterministic template; version + history only when the text changed |
+| `archive_old_turns` | hourly group | no | working-memory window: active `turn` episodes older than `working_window_hours` or beyond the newest `working_window_turns` per session → `archived` |
+| `reflect` | every `reflect_interval_h` | yes (`prompts/reflect.md`) | ≤ 5 higher-order insights over the last 7 days of unreflected summary/note episodes, written as beliefs (`source_kind='curator'`, `is_belief=true`, confidence ≤ 0.6 — the staging gate applies), `embedding NULL` (backfilled); episodes marked `meta.reflected` |
+| `dedup_facts` | daily group | no | merges near-duplicate **active set values** of one key (cosine ≥ `dedup_cosine` on stored embeddings, or normalised containment): keeps the human-stated / richer / newer row, folds usage counters into it, retracts the other with reason `curator-dedup` (a non-blocking tombstone) |
+| `decay` | daily group | no | archives **machine-sourced** (`extracted`, `curator`, `imported`), never-recalled (`access_count=0`) **semantic** facts older than `decay_min_age_days` whose `decay_score = importance × (1+ln(1+access_count)) × source_trust × 2^(−age/half_life)` is below `decay_archive_threshold`; never explicit/detector rows, never profile/procedural |
+| `prune_snapshots` | daily group | no | deletes recall snapshots older than 90 days |
+
+Every pass is idempotent, re-verifies its targets inside the transaction right before writing, takes
+`dry_run`, and returns a small report the worker logs as one line.
+
+## 5. Worker and queue (`cognify/worker.py`)
+
+- **Single leader.** The loop drains only while it holds `pg_try_advisory_lock(43)` on a dedicated
+  connection; a second service instance (or a developer process) pointed at the same database simply idles
+  on the lock. The lock is re-checked every tick and re-acquired if the connection dropped.
+- **Tick** (`ASTORIA_COGNIFY_POLL_S`, 30 s; immediate on start): `embed_backfill` → `drain_once`
+  (claim ≤ `cognify_batch` ready rows ordered by `priority, occurred_at` with `FOR UPDATE SKIP LOCKED`,
+  reclaiming rows stuck `running` > 30 min; coalesce per `(user_id, session_id)`; process each group in
+  its own transaction) → curator groups that are due (`hourly`, `reflect`, `daily`).
+- **Failure.** LLM unavailable or unusable output → rows `failed`, `next_attempt_at` backed off 1 / 5 /
+  15 / 60 / 240 min by attempt, `dead` after `max_attempts` (5); nothing written. Jobs whose episode was
+  deleted → `skipped`. `queue_stats` (REST `/op`, `astoria queue`) shows counts by state, oldest per
+  state, the last 20 dead jobs and the embedding backlog.
+- Queue `kind` is normally `extract`; `rederive_profile` and `embed_backfill` kinds are routed to the
+  curator when present.
+
+## 6. Trust model
+
+Trust is **explicit, bounded, and used for ranking and gating — never as the conflict resolver**.
+Conflicts are decided by assertion order, cardinality, tombstones and the guards below.
+
+| quantity | definition |
+|---|---|
+| default confidence by `source_kind` (`KIND_CONF`) | explicit .90 · detector .80 · extracted = the LLM's value clamped to [.30, .85] · imported .45 · curator .50 |
+| clamps | `[confidence_floor 0.05, confidence_cap 0.98]` |
+| corroboration | independent re-assert (different origin episode **and** different client): `confidence ← 1 − (1 − confidence) × 0.6` |
+| `source_trust` | `min(CLIENT_TRUST[source], KIND_TRUST[source_kind], confidence)` — client caps: `cli`/`human` 1.0, `input`/`claude-code` .85, `api`/`mcp` .7, `megaplan` .6, `curator`/`anonymous` .5, `import` .4, unknown .6; kind caps: explicit 1.0, detector .9, extracted .75, curator .5, imported .45 |
+| staging gate | extracted / imported / curator with confidence < `confidence_staging_threshold` (0.35) → `staging` (not recalled) until approved |
+| trust guard | a machine-sourced value (`extracted`, `imported`, `curator`) **never silently supersedes** a human-stated active value (`explicit`, `detector`) on a **functional** key. It supersedes only when the writer explicitly declared `contradicts` against that row (the extractor saw the candidate and judged a real contradiction). An incidental same-key assertion lands in `staging` with `meta.conflict_with=<active id>` and an audit row `conflict_staged`. The guard yields to assertion order: an older statement takes the history path instead. |
+| recall weight | `0.25 + 0.25·recency + 0.25·importance + 0.25·(confidence × source_trust)` |
+
+Approving a staging row (`POST /approve`) re-asserts it as `explicit` with confidence ≥ 0.8 through the
+normal supersede path, so functional keys stay unique.
+
+## 7. Read path (`retrieval/recall.py`, no LLM)
+
+```
+query ─► embed (query prefix) ─► candidates ─► RRF ─► weight ─► graph expansion ─► rerank ─► collapse ─► budget ─► context
+```
+
+1. **Query embedding** with the `search_query:` prefix (documents use `search_document:`). Embedder down
+   → BM25 only, `health.tei="down"`, `degraded=true`.
+2. **Candidates.** Facts (layers ∩ `{profile, semantic, procedural}`, `status='active'`, valid now):
+   top-40 by cosine (HNSW, `SET LOCAL hnsw.ef_search=64`, `hnsw.iterative_scan=relaxed_order` so a user
+   holding a small share of a multi-user index still gets full candidates after the `user_id/status/layer`
+   filter; cosine ≥ `recall_min_cosine`) ⊕ top-40 BM25 (`ts_rank_cd` over an **OR tsquery** of the query
+   words expanded with a small synonym map that bridges everyday words to predicate vocabulary — `family` →
+   spouse/kids/parents/pet…, `job` → role/employer…). Episodes (unless `facts_only` or `episodic` not in
+   `layers`): top-20 ⊕ top-20 over `summary/note/import/turn`, excluding this session's own turns.
+   With `as_of`, fact candidates come from `facts.as_of` (valid axis, optional belief axis) ranked by BM25
+   only.
+3. **RRF** `Σ 1/(60 + rank)` over the lists an item appears in; then `score = rrf × (0.25 + 0.25·recency +
+   0.25·importance + 0.25·trust)` with recency `2^(−age/half_life)` — episodic 30 d, semantic 180 d,
+   beliefs 60 d, profile/procedural none; episode trust fixed at 0.6.
+4. **Graph expansion** (current-time recalls only, `graph_max_depth > 0`): the top-10 fact candidates and
+   the entities they are about seed a bounded walk over active edges (`retrieval/graph.expand_candidates`):
+   facts reached over edges, and facts *about* reached entities (the user hub is skipped) join the pool
+   with `score = min(pool score) / (1 + hops)` — always below the seeds, never a failure.
+5. **Rerank** (optional, §4 of CONFIGURATION): the top-`rerank_top_n` facts + top-6 episodes by score are
+   sent as `(query, hook)` pairs to the cross-encoder; `score ← blend(score, sigmoid(logit), w)`. Reranked
+   items carry `rerank_score` (the raw logit). Endpoint down → base order, `health.rerank="down"`;
+   `rerank=false` or stage disabled → `"off"`.
+6. **Collapse**: one row per functional `(subject, predicate)` (the best), all rows for set keys.
+   Episodes capped at 3.
+7. **Budget**: facts first, then episodes; each item costs `len(hook)/4` tokens against `max_tokens`
+   (default 1000); at most `limit` items (default 12).
+8. **Stale hint** (current-time only): a selected functional fact gets `stale_hint=true` when a newer
+   active episode mentions its key (FTS on the predicate words, and the subject unless it is the user)
+   but not its current value.
+9. **Side effects**: one `snapshot` row; `access_count`/`last_seen` bumped on what was shown (not for
+   `as_of` queries).
+10. **Output**: `items` (facts and episodes in one ranked list), `working` (last 4 turns of `session_id`,
+    oldest first), `profile` (narrative + profile facts when `include_profile`), `context` — the
+    pre-rendered block clients inject verbatim:
 
 ```
 Relevant memory (current facts are authoritative; past conversation may be outdated):
-- rick favorite beer: IPA  [profile · 0.90]
-- rick uses tool: Neovim  [semantic · 0.84 · stale?]
-- from a past session (2026-08-20): …  [episodic]
+- alice favorite beer: IPA  [profile · 0.90]
+- alice uses tool: Neovim  [semantic · 0.84 · stale?]
+- from a past session (2026-05-02): …  [episodic]
 ```
-Empty store → `context: ""`.
 
-**Time travel:** `as_of` (valid axis) and optional `as_believed_at` (belief axis) switch the fact
-candidates to `facts.as_of(...)` (status `active|superseded`, `valid_from ≤ at < valid_to`, newest
-assertion per key) ranked by BM25 only (no vector, no access bumps); episodes are filtered by
-`occurred_at ≤ at`.
+`briefing` is the stable, cache-friendly prefix: narrative + all active profile facts + top-10 semantic
+facts by `importance × confidence × recency`, rendered as `Known about <user> (authoritative, as of
+DATE):`. `search_facts_simple` (facts-only hybrid search without budget/snapshot) backs `forget` by query
+and the target resolver's candidate search.
 
-**Briefing** (`GET /briefing`): `"Known about <user> (authoritative, as of DATE):"` + narrative + every
-active profile fact + the top-10 semantic facts by `importance × confidence × recency`, budgeted —
-a stable, cache-friendly prompt prefix (Claude Code's SessionStart hook injects it).
+## 8. API surfaces
 
-## 6. API surfaces
+- **REST** (`api/rest.py`): typed routes over the dispatcher plus `POST /op {action, …}` as the raw
+  mirror for scripts. `GET /docs` serves the OpenAPI UI.
+- **MCP** (`api/mcp_tools.py`, FastMCP streamable HTTP at `/mcp/`): `recall`, `capture`, `remember`,
+  `forget`, `memory(action=…)` and three compatibility tools (`retrieve_memory`, `add_memory`,
+  `get_user_profile`). Tool docstrings are the descriptions agents read.
+- **Compatibility routes** (`POST /retrieve`, `POST /memories`, `GET /users/{id}/profile`): the request
+  and response shapes of an earlier memory service, so existing integrations keep working while they
+  migrate to `recall`/`capture`.
+- **CLI** (`cli/`): a typer client over REST; never touches the database.
+- **Identity**: `Authorization: Bearer <token>` → client name via `ASTORIA_CLIENT_TOKENS`; else the
+  `X-Astoria-Client` hint; else `anonymous` (MCP calls without HTTP headers → `mcp`). With
+  `ASTORIA_REQUIRE_TOKEN=true`, writes without a valid token get `401`.
 
-- **REST** (`api/rest.py`): typed routes + `POST /op {action, …}` mirror; `GET /docs` (OpenAPI). Errors
-  are `{"error": "..."}` with 400/404/503; TEI/LLM outages never 500.
-- **MCP** (`api/mcp_tools.py`, FastMCP streamable-HTTP mounted at `/mcp/` — trailing slash): tools
-  `recall · capture · remember · forget · memory(action=…)` + MemoryOS-compat `retrieve_memory ·
-  add_memory · get_user_profile`. Tool docstrings are the descriptions agents see.
-- **Identity** (`api/auth.py`): `Authorization: Bearer <token>` → client name via `ASTORIA_CLIENT_TOKENS`
-  (`name:token,…`); else the unauthenticated `X-Astoria-Client: <name>` hint is trusted as-is (LAN-only);
-  else `anonymous` (MCP without headers → `mcp`). The name becomes `fact.source`, the audit actor, the
-  snapshot client and the trust cap.
-- **MemoryOS-compat layer** (served during the migration so every client could move by URL alone):
-  `POST /retrieve {user_id, query}` → `{short_term_history (last 4 turns across sessions), retrieved_pages
-  (episodes), retrieved_user_knowledge (facts), retrieved_assistant_knowledge: [], user_profile ("None"
-  when empty)}` · `POST /memories {user_id, user_input, agent_response, timestamp?}` → `{status: "ok",
-  episode_id, deduped, queued}` (= capture a turn) · `GET /users/{id}/profile` → `{user_id, user_profile}`;
-  the same three as MCP tools. All migrated clients now use the native routes; the compat layer stays for
-  stragglers and is cheap to keep.
+## 9. Process and degrade behaviour
 
-Full route/tool reference with examples: [API.md](API.md).
+One `uvicorn` worker process (`Dockerfile` CMD). Lifespan: enter FastMCP's session manager → `db.migrate()`
+→ start the worker task → serve → stop worker (10 s grace) → close the pool. If FastMCP fails to import,
+REST still comes up with MCP disabled (logged). Request log = JSON lines on stdout
+`{ts, method, path, status, ms, client}`.
 
-## 7. Process, deployment, degrade behaviour
+| failure | effect | recovery |
+|---|---|---|
+| embedder down / wrong model on every endpoint | new rows stored with `embedding NULL`; recall BM25-only, `health.tei="down"`, `degraded=true`; `/health.tei.ok=false` (HTTP still 200) | failed endpoints retried after 60 s (wrong model: 600 s); `embed_backfill` fills the NULLs on the next tick |
+| one of several embedding endpoints down | transparent fail-over to the next in priority order | automatic within a minute of the endpoint returning |
+| reranker down | base ranking, `health.rerank="down"` | automatic (60 s cooldown) |
+| primary LLM down | `llm.chat` falls back to Anthropic when `ANTHROPIC_API_KEY` is set | automatic; `/health.llm.saint` reports the primary as unreachable |
+| primary and fallback LLM both down | queue rows `failed` with back-off, `dead` after 5; `resolve` returns `503` with `error_kind: llm_unavailable`; profile narrative falls back to the template; reflect writes nothing | natural-language corrections are eventually consistent; structured ops and the detector are immediate |
+| LLM returns unusable output | one repair retry, then `failed` (back-off) — nothing written | as above |
+| Postgres down | `/health` 503 `status=error`; every action errors | compose `restart: unless-stopped` |
+| worker crash | supervised task logs and exits; API keeps serving; `queue.pending` grows | restart the service |
+| second service instance | it serves reads/writes but does not drain (advisory lock) | — |
 
-- **One process**: `uvicorn astoria.api.app:app --workers 1` (Dockerfile) hosting FastAPI + FastMCP
-  + the worker task. Lifespan = enter FastMCP's session manager → `db.migrate()` → start worker → serve →
-  stop worker (10 s grace) → close pool. If FastMCP fails to import, REST still comes up (MCP disabled,
-  logged). Request log = JSON lines on stdout `{ts, method, path, status, ms, client}`.
-- **Compose** (`deploy/nas/docker-compose.yml` → `/volume1/docker/astoria/`): `astoria-postgres`
-  (pgvector pg18, `./pgdata`, `127.0.0.1:8934`, 1 GB) · `astoria` (built from `./src`, `:8933`,
-  768 MB, `./data`) · `astoria-backup` (pg_dump every `BACKUP_INTERVAL_S`=21600 s keep `BACKUP_KEEP`=14
-  → `./backups`). Embeddings come from the existing `memoryos-tei` container (`:8931`, separate compose).
-- **Degrade matrix**
+## 10. Limitations and roadmap (honest)
 
-  | failure | effect | recovery |
-  |---|---|---|
-  | TEI `:8931` down / wrong model | new rows are stored with `embedding=NULL`; recall is BM25-only and reports `health.tei=down, degraded=true`; `/health.tei.ok=false` (still 200) | curator `embed_backfill` every 15 min fills the NULLs; the served-model assertion (`nomic-embed` substring, cached 10 min) refuses a mismatched model so vector spaces never mix |
-  | SAINT down (**every night** — the workstation powers off) | `llm.chat` falls to direct Anthropic `claude-sonnet-4-6` (enabled on the NAS via `ANTHROPIC_API_KEY`); cognify keeps flowing overnight at cloud cost | automatic; `/health.llm.saint="unreachable"` meanwhile |
-  | SAINT and cloud both unavailable | jobs → `failed` with backoff 1/5/15/60/240 min, `dead` after 5; nothing written | ambient NL corrections are **eventually consistent** until extraction runs; structured ops and the regex detector are immediate |
-  | LLM returns garbage | repair retry once, then `failed` (backoff) — never writes junk | as above |
-  | Postgres down | `/health` 503 `status=error`; every action errors | compose restarts; `restart: unless-stopped` |
-  | worker crash | supervised task logs and exits; API keeps serving; `queue.pending` grows | restart the container |
-  | NAS reboot | all three containers `restart: unless-stopped`; migrations re-run idempotently | — |
-
-## 8. Limitations and roadmap (v1)
-
-- **Belief axis is lossy on supersede.** Closing the old functional row rewrites its `valid_to` *in
-  place*, so `as_of(at, as_believed_at=B)` with `B` before the correction and `at` after the new
-  `valid_from` no longer returns the value we believed at `B`. Roadmap: version the old row on the belief
-  axis (insert a closed copy, leave the original's `valid_to` as it was believed).
-- Regex detector v1 covers a handful of English patterns; everything else waits for cognify
-  (overnight window above). Roadmap: an LLM *target-resolver* for natural-language forget/correct
-  (deterministic execution, LLM only to resolve the target).
-- Graph/edge retrieval is not built (`graph_max_depth/fanout` settings exist but are unused);
-  `related_to` is just a set predicate today. Roadmap: per-layer retrieve-then-merge, a local
-  cross-encoder rerank seat via johnny, AGE as an ETL.
-- Profile narrative is template-rendered (`source='template'`); an LLM narrative (`source='llm'`) is
-  reserved but not implemented.
-- Several `Settings` knobs are reserved, not wired (`recall_limit/token_budget/min_score`,
-  `vector/fts_candidates`, `w_*`, `recency_half_life_days`, `contiguity_boost`, `trust_prior_*`,
-  `belief_half_life_days`, `cognify_poll_s`, `curator_interval_min`, `backup_*`, `working_window_*`,
-  `decay_archive_threshold`); the live values are the module constants documented above. Wired:
-  `db_*`, `user_default`, `client_tokens`, `embed_*`, `llm_*`, `anthropic_api_key`, `recall_min_cosine`,
-  `confidence_floor/cap/staging_threshold`, `worker_enabled`, `cognify_batch`, `host/port/log_level`.
-- Single-user in practice (`user_id` default `rick`), multi-user-ready (every table keyed by `user_id`,
-  `DELETE /users/{id}` wipes one).
-- No telemetry, no external calls except TEI (NAS), SAINT (LAN) and — only for the cognify fallback —
-  `api.anthropic.com`.
-
-### Addendum 2026-08-22 — trust guard on functional keys
-A machine-sourced value (`source_kind` extracted / imported / curator) does **not** silently supersede a
-human-stated active value (`explicit` / `detector`) on a functional key. It supersedes only when the
-extractor explicitly declared `contradicts` against that row (it saw the candidate and judged a real
-contradiction — e.g. *"actually my favorite beer is IPA"*). An incidental same-key assertion (e.g.
-*"grew up near Skiatook"* extracted as `location`) lands in **staging** with `meta.conflict_with` and an
-audit row `conflict_staged`; `astoria staging` / `astoria approve <id>` resolve it. Motivation: the
-Claude/Gemini memory-export ingest on 2026-08-22, where a third-party summary briefly overrode an explicit
-location fact.
+- **Heuristic, not learned.** The regex detector covers a handful of English patterns; the BM25 synonym
+  map is a small hand-written table; trust caps and decay weights are constants. They are deliberately
+  simple and auditable, and they are where tuning will happen next.
+- **Several `Settings` knobs are reserved, not wired** (`recall_limit`, `recall_token_budget`,
+  `recall_min_score`, `vector_candidates`, `fts_candidates`, `w_*`, `contiguity_boost`, `trust_prior_*`,
+  `backup_*`, `host`/`port`); the live values are the module constants listed in CONFIGURATION.md. Recall's
+  half-lives are constants; the `*_half_life_days` settings govern the curator's decay only.
+- **Extraction and reflection are only as good as the LLM and the prompts**; the guards (staging gate,
+  trust guard, tombstones, near-duplicate guard, candidate-id validation) bound the damage, they do not
+  remove the dependency.
+- **Graph layer v1**: edges and aliases are written by the extractor and by hand; expansion is a bounded
+  undirected walk with a hop penalty. There is no edge-level temporal reasoning in recall yet, and no
+  entity summaries are generated automatically.
+- **Reranker is CPU-sized by default** (22 M-parameter MiniLM, 240-char texts, top-30). The measured
+  ranking gain is real but modest and costs a few hundred milliseconds cold; a GPU reranker or a larger
+  model is a drop-in change of `ASTORIA_RERANK_URLS`.
+- **Multi-user-ready, single-tenant-minded**: every table is keyed by `user_id` and `DELETE /users/{id}`
+  wipes one, but there is no per-user authorisation — any caller may name any `user_id`.
+- **Vector footprint**: ~8.6 KB per embedded row (HNSW + TOAST); the practical knee on a small host with
+  a 1 GiB Postgres limit is ~200 k embedded rows (see PERFORMANCE.md §4) — raise memory, switch to
+  `halfvec`, or stop embedding raw turns before then.
