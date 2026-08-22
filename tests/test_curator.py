@@ -166,9 +166,9 @@ def test_decay_score_shape():
     now = datetime.now(UTC)
     base = {"importance": 0.5, "access_count": 0, "source_trust": 0.6, "is_belief": False, "last_seen": now}
     assert abs(curator.decay_score(base, now=now) - 0.3) < 1e-9
-    half = dict(base, last_seen=now - timedelta(days=settings().recency_half_life_days))
+    half = dict(base, last_seen=now - timedelta(days=settings().decay_half_life_days))
     assert abs(curator.decay_score(half, now=now) - 0.15) < 1e-6
-    belief = dict(base, is_belief=True, last_seen=now - timedelta(days=settings().belief_half_life_days))
+    belief = dict(base, is_belief=True, last_seen=now - timedelta(days=settings().decay_belief_half_life_days))
     assert abs(curator.decay_score(belief, now=now) - 0.15) < 1e-6
     assert curator.decay_score(dict(base, access_count=5), now=now) > curator.decay_score(base, now=now)
 
