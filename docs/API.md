@@ -55,7 +55,7 @@ H='Content-Type: application/json'
 `GET /health` → `200` iff the database answers, else `503`.
 
 ```json
-{"status":"ok","version":"0.1.0",
+{"status":"ok","version":"0.1.0","user_default":"alice",
  "db":{"facts_active":1240,"episodes_active":3180,"cognify_pending":0,"pgvector":"0.8.6"},
  "queue":{"pending":0,"dead":0,"by_state":{"done":412}},
  "tei":{"ok":true,"active":"http://gpu-box.local:4000","model":"nomic-embed",
@@ -82,8 +82,8 @@ Request (all optional except `query`):
 | `query` | `""` | natural-language query |
 | `session_id` | — | also returns the last 4 turns of this session as `working`; this session's own turns are excluded from search |
 | `layers` | all four | any of `profile, semantic, procedural, episodic` (list or comma string) |
-| `max_tokens` | 1000 | budget for `items` (≈ chars/4) |
-| `limit` | 12 | max items |
+| `max_tokens` | `ASTORIA_RECALL_TOKEN_BUDGET` (1000) | budget for `items` (≈ chars/4) |
+| `limit` | `ASTORIA_RECALL_LIMIT` (12) | max items |
 | `facts_only` | false | skip episodes |
 | `include_profile` | false | add `profile: {narrative, version, facts}` |
 | `as_of` | — | point in time on the valid axis (BM25-ranked; no vector stage) |
@@ -200,7 +200,8 @@ Identical to `POST /facts` (a semantic alias: "supersede the current value").
 
 Body: any of `value, confidence, importance, tags, layer, valid_from, valid_to, asserted_at, is_belief,
 ref, status (active|archived|staging), evidence, detail` (+ `user_id`). Changing `value` re-renders the
-hook and re-embeds inline. → updated fact · `404`.
+hook and re-embeds (inline with `ASTORIA_EMBED_SYNC=true`, otherwise nulled and backfilled by the worker).
+→ updated fact · `404`.
 
 #### `DELETE /facts/{id}?user_id=alice&mode=soft|hard`
 
@@ -345,7 +346,7 @@ and `capture`.
 
 Connect an MCP client to `http://nas.local:8933/mcp/` (trailing slash). Identity comes from the same HTTP
 headers as REST (`Authorization: Bearer …` or `X-Astoria-Client`); without headers the client is `mcp`.
-The `user_id` parameter of every tool defaults to the built-in default user.
+Every tool takes `user_id` (default `""` → the server applies `ASTORIA_USER_DEFAULT`).
 
 | tool | signature | behaviour |
 |---|---|---|

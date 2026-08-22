@@ -14,7 +14,7 @@ the design record; explanations in [ARCHITECTURE.md](ARCHITECTURE.md); request/r
   OpenAI-compatible endpoint(s) (`ASTORIA_EMBED_URLS`, priority order, verified vector space).
   **Reranker** (optional): TEI `POST /rerank`. **LLM**: OpenAI-compatible primary → Anthropic fallback;
   write path only (cognify, curator) plus the on-demand target resolver.
-- **Identity**: every request carries `user_id` (default `ASTORIA_USER_DEFAULT`). `Authorization: Bearer
+- **Identity**: every request carries `user_id` (omitted/empty → `ASTORIA_USER_DEFAULT`, reported in `/health.user_default`). `Authorization: Bearer
   <token>` → client name via `ASTORIA_CLIENT_TOKENS`; else `X-Astoria-Client` hint; else `anonymous`
   (MCP: `mcp`). The client name is the fact `source` and selects the trust cap. `ASTORIA_REQUIRE_TOKEN`
   gates writes (`401`).
@@ -62,7 +62,7 @@ facts.upsert_fact(c, *, user_id, subject, predicate, value, source="api", source
 facts.retract(c, *, user_id, subject=None, predicate=None, value=None, fact_id=None, actor=None,
               source_kind="explicit", reason="retract") -> [rows]
 facts.forget(c, *, user_id, fact_id, mode="soft"|"hard", actor=None) -> row|None
-facts.update_fact(c, *, user_id, fact_id, actor=None, **fields) -> row|None
+facts.update_fact(c, *, user_id, fact_id, actor=None, embed=None, **fields) -> row|None   # embed=None → settings.embed_sync
 facts.approve_staging(c, *, user_id, fact_id, actor=None) -> row|None
 facts.get_fact / list_facts(c, *, user_id, subject, predicate, status="active"|"any", layer, q, limit, offset)
 facts.history(c, *, user_id, subject, predicate, include_expired=False) -> [rows newest-first]
@@ -112,6 +112,7 @@ llm.chat_json(messages, *, model=None, max_tokens=1500) -> dict|list|None; llm.l
 recall.recall(c, *, user_id, query, session_id=None, layers=("profile","semantic","procedural","episodic"),
               max_tokens=1000, limit=12, facts_only=False, include_profile=False, as_of=None,
               as_believed_at=None, client=None, min_cosine=None, rerank=None) -> dict (see REST)
+              # service passes settings.recall_token_budget / recall_limit when the request omits them
 recall.briefing(c, *, user_id, max_tokens=1200) -> {"narrative", "facts": [...], "context": str}
 recall.search_facts_simple(c, *, user_id, query, limit=20, min_cosine=None) -> [public rows + score]
 recall.render_context(items) -> str
@@ -151,7 +152,7 @@ All JSON; timestamps ISO-8601 (UTC if naive); errors `{"error": "..."}` with 400
 | Method & path | Body → Response |
 |---|---|
 | `GET /` | `{service, version, docs, mcp}` |
-| `GET /health` | `{status, version, db, queue, tei, llm, rerank}` — **200 iff DB ok** |
+| `GET /health` | `{status, version, user_default, db, queue, tei, llm, rerank}` — **200 iff DB ok** |
 | `POST /recall` | `{user_id, query, session_id?, layers?, max_tokens=1000, limit=12, facts_only, include_profile, as_of?, as_believed_at?, rerank?, min_cosine?}` → `{user_id, query, items:[RecallItem], working, profile, context, health:{tei, degraded, rerank}, snapshot_id, as_of, as_believed_at}` |
 | `POST /capture` | `{user_id, kind, text? \| user_input?+agent_response?, source?, session_id?, occurred_at?, importance?, tags?, meta?, cognify=true, priority, sync?}` → `{episode_id, deduped, dropped, detector, queued}` |
 | `GET /briefing?user_id&max_tokens` | `{narrative, facts, context}` |
@@ -191,10 +192,10 @@ Relevant memory (current facts are authoritative; past conversation may be outda
 
 ## MCP tools — `astoria/api/mcp_tools.py`
 
-- `recall(query, user_id, layers=None, limit=12, max_tokens=1000, as_of="", include_profile=False, session_id="", facts_only=False)`
-- `capture(text="", user_input="", agent_response="", kind="note", user_id, session_id="", source="", importance=0.5, tags=None, cognify=True, priority="normal")`
-- `remember(subject, predicate, value, user_id, valid_from="", valid_to="", retract=False, layer="", confidence=None, tags=None)`
-- `forget(fact_id="", subject="", predicate="", value="", query="", mode="soft", user_id)`
+- `recall(query, user_id="", layers=None, limit=12, max_tokens=1000, as_of="", include_profile=False, session_id="", facts_only=False)`
+- `capture(text="", user_input="", agent_response="", kind="note", user_id="", session_id="", source="", importance=0.5, tags=None, cognify=True, priority="normal")`
+- `remember(subject, predicate, value, user_id="", valid_from="", valid_to="", retract=False, layer="", confidence=None, tags=None)`
+- `forget(fact_id="", subject="", predicate="", value="", query="", mode="soft", user_id="")`
 - `memory(action, …)` — `resolve | resolve_apply | list | facts | get | update | delete | history | as_of | profile |
   briefing | predicates | approve | episodes | audit | health | graph | edges | edge_add | edge_delete | aliases |
   alias_add | alias_delete`
@@ -206,7 +207,7 @@ Relevant memory (current facts are authoritative; past conversation may be outda
 candidates: facts top-40 cosine (HNSW, `hnsw.ef_search=64`, `hnsw.iterative_scan=relaxed_order`, cosine ≥
 **0.45**) ⊕ top-40 BM25 (`ts_rank_cd`, OR-tsquery of query words + synonym expansion); episodes 20 ⊕ 20
 (not this session's turns) → RRF k=60 → `score = rrf × (0.25 + 0.25·recency + 0.25·importance +
-0.25·trust)`, recency `2^(−age/half_life)` (episodic 30 d · semantic 180 d · beliefs 60 d · profile/procedural
+0.25·trust)`, recency `2^(−age/half_life)` (settings: episodic 30 d · semantic 180 d · beliefs 60 d; profile/procedural
 ∞), `trust = confidence × source_trust` (episodes 0.6) → graph expansion (top-10 seeds, ≤ `graph_max_depth`
 hops, `score = min/(1+hops)`) → optional rerank (top-`rerank_top_n` facts + 6 episodes, `(1−w)·norm(score)
 + w·norm(sigmoid(logit))`, w = 0.6) → collapse by `(subject, predicate)` (functional → 1 row) → budget

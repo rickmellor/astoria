@@ -82,14 +82,15 @@ clients ──REST :8933 / MCP /mcp/ / CLI──►  astoria (FastAPI + FastMCP 
 
 ```bash
 # 1. service (docker compose)
-cp deploy/nas/.env.example deploy/nas/.env   # set POSTGRES_PASSWORD, ASTORIA_EMBED_URLS, ASTORIA_LLM_URL/MODEL, ASTORIA_USER_DEFAULT
+cp deploy/nas/.env.example deploy/nas/.env   # set POSTGRES_PASSWORD, ASTORIA_EMBED_URL(S), ASTORIA_LLM_URL/MODEL, ASTORIA_USER_DEFAULT
 docker compose -f deploy/nas/docker-compose.yml up -d --build astoria-postgres astoria astoria-backup
 #   (add `astoria-rerank` once deploy/nas/rerank-model holds a cross-encoder snapshot — optional)
 curl -s http://localhost:8933/health | jq .status        # "ok"; OpenAPI at /docs; MCP at /mcp/
 
 # 2. CLI (anywhere that can reach the service)
 pip install .                                            # console script `astoria`
-export ASTORIA_URL=http://nas.local:8933 ASTORIA_USER=alice   # + ASTORIA_TOKEN for attributed writes
+export ASTORIA_URL=http://nas.local:8933                 # default http://localhost:8933; ASTORIA_USER overrides the server default user;
+                                                         # ASTORIA_TOKEN for attributed writes
 astoria remember alice favorite_beer IPA
 astoria correct  alice favorite_beer Pilsner             # supersedes, keeps history
 astoria history  alice favorite_beer
@@ -99,6 +100,9 @@ astoria forget "the thing about Pilsner"                 # LLM resolves the targ
 
 # 3. agents: point an MCP client at http://nas.local:8933/mcp/ and call recall / capture / remember / forget
 ```
+
+For development without Docker: `pip install -e .[dev]`, a Postgres with pgvector, a repo-local `.env`
+(the settings loader reads it), then `uvicorn astoria.api.app:app --port 8933`.
 
 You need a **nomic-embed-text-v1.5** endpoint (Hugging Face TEI, vLLM, llama.cpp server — anything
 OpenAI-compatible) and, for extraction, an OpenAI-compatible chat endpoint and/or an Anthropic key. Without

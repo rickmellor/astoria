@@ -35,9 +35,11 @@ curl -s http://nas.local:8933/health | jq .status  # "ok"
 ```
 
 `deploy/nas/deploy.sh` is a reference script for the "build on a workstation, ship the source tree over
-ssh, compose up" pattern; it reads the target host and directory from `ASTORIA_NAS_SSH` /
-`ASTORIA_NAS_DIR`, never copies `.env`, and rewrites the compose build context to the shipped source
-directory. Adapt it or replace it with your registry/CI flow.
+ssh, compose up" pattern. It reads site values from the gitignored `deploy/nas/deploy.env`
+(`ASTORIA_NAS_SSH` — ssh host alias, default `nas`; `ASTORIA_NAS_DIR` — deploy directory, default
+`/opt/astoria`; `ASTORIA_URL` for the post-deploy health check), never copies `.env`, rewrites the compose
+build context to the shipped source directory, and refuses to start when `$DEST/.env` is missing. Adapt it
+or replace it with your registry/CI flow.
 
 Upgrade = rebuild the image and restart the service; **migrations apply themselves** at start-up
 (`astoria/sql/NNN_*.sql` in lexical order, each recorded in `schema_migrations`):
@@ -83,6 +85,7 @@ What to look at:
 | `rerank.status` | `on` (or `off` if you disabled it) | `down` — reranker endpoints unreachable; recall keeps the base order |
 | `queue.pending` | small, not growing | growing → LLM path broken or the worker is not the leader (§4) |
 | `queue.dead` | 0 | jobs that exhausted 5 attempts (§4) |
+| `user_default` | your user id | the `user_id` applied to requests that omit one (`ASTORIA_USER_DEFAULT`) |
 
 ## 4. Cognify queue, worker, dead letters
 
@@ -203,9 +206,9 @@ scratch stack from the dump, `astoria export` that user, `astoria import` into p
 | write-path embedding | asynchronous (`ASTORIA_EMBED_SYNC=false`); backfill 200 facts + 200 episodes per 30 s tick | `.env`; `worker.EMBED_BACKFILL_LIMIT` |
 | embedding endpoints | priority list, fastest first | `ASTORIA_EMBED_URLS` — the embedder, not Postgres, was the throughput ceiling in the scale run (CPU TEI ≈ 6.5 embeds/s) |
 | reranker | top-30 facts + 6 episodes, 240-char texts, weight 0.6, 3 s timeout | `ASTORIA_RERANK_*`; a GPU reranker allows a larger `TOP_N` |
-| recall candidates | 40 vector ⊕ 40 BM25 facts, 20 ⊕ 20 episodes, `hnsw.ef_search=64`, `iterative_scan=relaxed_order`, cosine ≥ 0.45 | `retrieval/recall.py` constants, `ASTORIA_RECALL_MIN_COSINE` |
+| recall | 40 vector ⊕ 40 BM25 facts, 20 ⊕ 20 episodes, `hnsw.ef_search=64`, `iterative_scan=relaxed_order`; cosine ≥ 0.45, default `limit` 12 / `max_tokens` 1000, half-lives 30/180/60 d | `retrieval/recall.py` constants; `ASTORIA_RECALL_MIN_COSINE`, `ASTORIA_RECALL_LIMIT`, `ASTORIA_RECALL_TOKEN_BUDGET`, `ASTORIA_*_HALF_LIFE_DAYS` |
 | cognify | 4 jobs / 30 s tick, ≤ 8 episodes or 6000 chars per LLM call, 120 s LLM timeout | `ASTORIA_COGNIFY_*`, `ASTORIA_LLM_TIMEOUT_S` |
-| retention | snapshots 90 d; working turns archived after 72 h or beyond 20 per session; machine facts decayed after 90 d unused; backups 14 × 6 h | curator settings, `BACKUP_*` |
+| retention | snapshots 90 d; working turns archived after 72 h or beyond 20 per session; machine facts decayed after 90 d unused (decay half-lives 90 d / 45 d for beliefs); backups 14 × 6 h | curator settings, `BACKUP_INTERVAL_S`/`BACKUP_KEEP` |
 | Postgres autovacuum | scale factor 0.02 + fillfactor 90 on `fact`/`episode` (schema 004) | keeps recall's `last_seen` touch-updates HOT and bloat low |
 | bulk import | direct-SQL loads should drop the HNSW indexes, `COPY`, then `CREATE INDEX CONCURRENTLY` (`scripts/bench/seed.py --index-mode rebuild`) | in-place HNSW insert is ~100–200 rows/s on one core |
 

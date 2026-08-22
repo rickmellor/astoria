@@ -1,18 +1,18 @@
 # Astoria — configuration reference
 
-Everything Astoria reads at start-up comes from the environment (or a `.env` file the compose stack
-passes through `env_file`). Settings are declared once in `astoria/config.py` (`Settings`, pydantic-settings,
+Everything Astoria reads at start-up comes from the environment, from a `.env` file in the working
+directory (pydantic-settings `env_file=".env"` — handy for a development checkout), or from the `.env` the
+compose stack passes through `env_file`. Settings are declared once in `astoria/config.py` (`Settings`,
 env prefix `ASTORIA_`), cached for the life of the process, and read by the modules named in the tables
-below. Where a field is *reserved* (declared but not yet read by any code path) the table says so and
-names the constant that currently governs the behaviour, so that you are never tuning a knob that does
-nothing.
+below. Every field listed here is read by code; request parameters override the retrieval defaults per
+call.
 
 Conventions used here:
 
 - **env** — the variable name. Every `Settings` field is `ASTORIA_<FIELD_IN_UPPER_CASE>` except
   `ANTHROPIC_API_KEY`, which is read without the prefix.
-- **default** — the value shipped in `config.py`. Several shipped defaults for network endpoints are
-  LAN placeholders from the reference deployment; **always set the endpoint variables explicitly**.
+- **default** — the value shipped in `config.py`. Network defaults point at `localhost`; set the endpoint
+  variables explicitly for any real deployment.
 - **read by** — the module that consults the value (so you know what a change affects).
 
 ---
@@ -32,7 +32,7 @@ disable them. The service also creates the `vector` and `pgcrypto` extensions be
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
-| `ASTORIA_USER_DEFAULT` | the reference deployment's user id | `api/service.py` (`_uid`) | `user_id` used when a request omits one. Set it to your own user id; every table is keyed by `user_id`, so several users can share one instance. |
+| `ASTORIA_USER_DEFAULT` | `default` | `api/service.py` (`_uid`), `/health` | `user_id` applied when a request omits one (REST body/query, MCP tools with `user_id=""`, CLI without `ASTORIA_USER`). Set it to your own user id; every table is keyed by `user_id`, so several users can share one instance. Reported as `user_default` in `/health`. |
 | `ASTORIA_CLIENT_TOKENS` | `""` | `config.Settings.client_token_map()`, `api/auth.py` | Comma-separated `name:token` pairs. A request whose `Authorization: Bearer <token>` matches is attributed to `name` (fact `source`, audit `actor`, trust cap). Tokens are opaque strings you generate (e.g. `openssl rand -hex 24`). |
 | `ASTORIA_REQUIRE_TOKEN` | `false` | `api/auth.py` (`require_write_token`) | When `true`, every **write** action (anything not in `auth.READ_ACTIONS`) needs a valid bearer token and returns `401` otherwise. Reads stay open. Turn this on before exposing the port beyond a trusted network. |
 
@@ -53,13 +53,13 @@ serves a different model or dimension, so two endpoints can never write incompat
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
-| `ASTORIA_EMBED_URLS` | a two-endpoint LAN placeholder | `core/embed.py` | **Priority list** `url\|model,url\|model`. Endpoints are tried in order; the first usable one answers. Put the fastest (e.g. GPU) endpoint first and an always-on CPU endpoint last. Empty → `ASTORIA_EMBED_URL` alone. |
-| `ASTORIA_EMBED_URL` | a LAN placeholder | `core/embed.py` | Single-endpoint fallback used only when `ASTORIA_EMBED_URLS` is empty. Model name is then `nomic`. |
+| `ASTORIA_EMBED_URL` | `http://localhost:8931` | `core/embed.py` | Single embedding endpoint (model name `nomic`), used when `ASTORIA_EMBED_URLS` is empty. |
+| `ASTORIA_EMBED_URLS` | `""` | `core/embed.py` | Optional **priority list** `url\|model,url\|model`. Endpoints are tried in order; the first usable one answers. Put the fastest (e.g. GPU) endpoint first and an always-on CPU endpoint last. Takes precedence over `ASTORIA_EMBED_URL` when set. |
 | `ASTORIA_EMBED_DIM` | `768` | `core/embed.py` | Expected vector width; must match the `vector(768)` columns. Changing it means a new schema and a full re-embed. |
 | `ASTORIA_EMBED_REQUIRE_SUBSTRING` | `nomic-embed` | `core/embed.py` | Served-model assertion. The part before the first `-` (`nomic`) must appear in the endpoint's response `model`, the configured model name, `GET /info` (TEI) or `GET /v1/models`. |
 | `ASTORIA_EMBED_TIMEOUT_S` | `20.0` | `core/embed.py` | HTTP timeout per embedding call. |
 | `ASTORIA_EMBED_MAX_CHARS` | `6000` | `core/embed.py` | Texts are truncated to this many characters before embedding (the model's own cap is 2048 tokens; TEI auto-truncates). |
-| `ASTORIA_EMBED_SYNC` | `false` | `core/capture.py`, `api/service.py` (`fact_add`) | `false` = **asynchronous write path**: `capture` and `POST /facts` store the row with `embedding NULL` and return without calling the embedder; the worker's `embed_backfill` fills it on its next tick (≤ 30 s by default). BM25 recall finds the row immediately; vector recall after backfill. `true` = embed inline in the request. A per-request `sync=true` overrides `false`. |
+| `ASTORIA_EMBED_SYNC` | `false` | `core/capture.py`, `api/service.py` (`fact_add`), `store/facts.py` (`update_fact`) | `false` = **asynchronous write path**: `capture`, `POST /facts` and a `PATCH` that changes a value store the row with `embedding NULL` and return without calling the embedder; the worker's `embed_backfill` fills it on its next tick (≤ 30 s by default). BM25 recall finds the row immediately; vector recall after backfill. `true` = embed inline in the request. A per-request `sync=true` forces inline embedding for that call. |
 
 Endpoint verification and failure handling (`core/embed.py`):
 
@@ -80,12 +80,13 @@ Endpoint verification and failure handling (`core/embed.py`):
 ## 4. Reranker (optional cross-encoder stage)
 
 Recall can send its top candidates through a TEI cross-encoder reranker (`POST /rerank`, raw logits) and
-blend the result into the ranking. The stage is optional and degrades to the base ranking.
+blend the result into the ranking. The stage is **off unless `ASTORIA_RERANK_URLS` is set**, and degrades
+to the base ranking when the endpoint is down.
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
-| `ASTORIA_RERANK_URLS` | a two-endpoint LAN placeholder | `core/rerank.py` | Priority list `url\|model,url\|model` of TEI reranker endpoints. **Empty string = stage off.** The model name is informational; the endpoint is verified through `GET /info` (TEI must report `model_type.reranker` or a model id mentioning `rerank`, `minilm` or `bge`). |
-| `ASTORIA_RERANK_ENABLED` | `true` | `core/rerank.py`, `retrieval/recall.py` | Kill switch. A per-request `rerank=false` also bypasses the stage. |
+| `ASTORIA_RERANK_URLS` | `""` (stage off) | `core/rerank.py` | Priority list `url\|model,url\|model` of TEI reranker endpoints. The model name is informational; the endpoint is verified through `GET /info` (TEI must report `model_type.reranker` or a model id mentioning `rerank`, `minilm` or `bge`). |
+| `ASTORIA_RERANK_ENABLED` | `true` | `core/rerank.py`, `retrieval/recall.py` | Kill switch for a configured stage. A per-request `rerank=false` also bypasses it. |
 | `ASTORIA_RERANK_TOP_N` | `30` | `retrieval/recall.py` | How many fact candidates (by base score) are reranked; plus the top 6 episode candidates (`recall.RERANK_EPISODES`). CPU-bound: ~0.3 ms per token on a small NAS CPU; 30 facts + 6 episodes ≈ 300–350 ms cold. Raise only with a GPU reranker. |
 | `ASTORIA_RERANK_WEIGHT` | `0.6` | `retrieval/recall.py` | `final = (1-w)·norm(base) + w·norm(sigmoid(logit))`, both min-max normalised over the reranked set and mapped back into the base-score range. |
 | `ASTORIA_RERANK_TIMEOUT_S` | `3.0` | `core/rerank.py` | Read-path timeout: fail fast and keep the base order. |
@@ -96,8 +97,8 @@ set sits within 1.0 of each other the reranker is treated as having no opinion a
 Failure cooldown 60 s; "not a reranker" cooldown 600 s. `GET /health` → `rerank.status` is `on` / `off` /
 `down`.
 
-The reference compose stack ships an `astoria-rerank` service running `cross-encoder/ms-marco-MiniLM-L-6-v2`
-(22 M parameters, CPU) on port 8935; see §9.
+The reference compose stack ships an optional `astoria-rerank` service running
+`cross-encoder/ms-marco-MiniLM-L-6-v2` (22 M parameters, CPU) on port 8935; see §9.
 
 ## 5. LLM (write path only)
 
@@ -106,8 +107,8 @@ on-demand target resolver (`/resolve`). Recall never calls an LLM.
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
-| `ASTORIA_LLM_URL` | a LAN placeholder `…/v1` | `core/llm.py` | Primary **OpenAI-compatible** chat-completions base URL (a local router, vLLM, or any `/v1/chat/completions` server). The code and `/health` refer to this route as `saint` (the router it was first built against). |
-| `ASTORIA_LLM_MODEL` | `saint-cloud-medium` | `core/llm.py`, `cognify/*` | Model name sent to the primary. Set it to whatever your gateway serves. |
+| `ASTORIA_LLM_URL` | `http://localhost:4000/v1` | `core/llm.py` | Primary **OpenAI-compatible** chat-completions base URL (a local router, vLLM, or any `/v1/chat/completions` server). The code and `/health` refer to this route as `saint` (the router it was first built against). |
+| `ASTORIA_LLM_MODEL` | `auto` | `core/llm.py`, `cognify/*` | Model name sent to the primary. Set it to whatever your gateway serves (`auto` suits routers that pick a model themselves). |
 | `ASTORIA_LLM_TIMEOUT_S` | `120.0` | `core/llm.py` | Timeout for both routes. |
 | `ASTORIA_LLM_FALLBACK_MODEL` | `claude-sonnet-4-6` | `core/llm.py` | Anthropic model used directly (official SDK) when the primary is unreachable **and** `ANTHROPIC_API_KEY` is set. |
 | `ANTHROPIC_API_KEY` | `""` | `core/llm.py` | Enables the direct-Anthropic fallback. Without it, LLM jobs back off until the primary returns. This is the only variable read without the `ASTORIA_` prefix. |
@@ -119,46 +120,54 @@ output returns `None` and callers retry/back off rather than writing anything.
 
 ## 6. Retrieval
 
-| env | default | status | read by | meaning |
-|---|---|---|---|---|
-| `ASTORIA_RECALL_MIN_COSINE` | `0.45` | wired | `retrieval/recall.py` | Cosine floor for vector candidates. nomic places short personal queries vs long hooks around 0.46–0.50; BM25 plus query synonyms carry the rest. A per-request `min_cosine` overrides. |
-| `ASTORIA_GRAPH_MAX_DEPTH` | `2` | wired | `retrieval/graph.py`, `store/graph.py`, `api/service.py` | Hops for graph expansion in recall and the default for `/graph` and `/edges?depth=`. `0` disables expansion. Hard cap 6. |
-| `ASTORIA_GRAPH_MAX_FANOUT` | `20` | wired | same | Strongest edges followed per node per hop (cap 200). |
-| `ASTORIA_RECENCY_HALF_LIFE_DAYS` | `90.0` | wired (curator only) | `curator/maintenance.py` (`decay_score`) | Half-life of the recency term in the **decay** score for non-belief facts. Recall's own half-lives are constants (`recall.HALF_LIFE_DAYS`: episodic 30 d, semantic 180 d, belief 60 d; profile/procedural never decay). |
-| `ASTORIA_BELIEF_HALF_LIFE_DAYS` | `45.0` | wired (curator only) | same | Decay half-life for `is_belief` facts. |
-| `ASTORIA_RECALL_LIMIT` | `12` | reserved | — | Not read. The live default is the request default `limit=12` (`service._recall`). |
-| `ASTORIA_RECALL_TOKEN_BUDGET` | `1200` | reserved | — | Not read. Live default `max_tokens=1000` for recall, `1200` for briefing (request defaults). |
-| `ASTORIA_RECALL_MIN_SCORE` | `0.15` | reserved | — | Not read. |
-| `ASTORIA_VECTOR_CANDIDATES` | `60` | reserved | — | Not read. Live values: 40 vector + 40 BM25 fact candidates, 20 + 20 episode candidates (`recall.VEC_TOPN_*`, `BM25_TOPN_*`). |
-| `ASTORIA_FTS_CANDIDATES` | `40` | reserved | — | Not read (see above). |
-| `ASTORIA_W_RECENCY` / `ASTORIA_W_IMPORTANCE` / `ASTORIA_W_TRUST` | `0.6` / `0.4` / `0.7` | reserved | — | Not read. Live score shape is additive: `rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)`. |
-| `ASTORIA_CONTIGUITY_BOOST` | `0.15` | reserved | — | Not read. |
+Request parameters override these per call.
+
+| env | default | read by | meaning |
+|---|---|---|---|
+| `ASTORIA_RECALL_LIMIT` | `12` | `api/service.py` (`_recall`) | Default `limit` (max items after collapse) for `/recall` and the MCP `recall` tool. |
+| `ASTORIA_RECALL_TOKEN_BUDGET` | `1000` | `api/service.py` (`_recall`) | Default `max_tokens` for `/recall` (≈ chars/4 of the hooks shown). Briefing's default budget is 1200 (request default). |
+| `ASTORIA_RECALL_MIN_COSINE` | `0.45` | `retrieval/recall.py` | Cosine floor for vector candidates. nomic places short personal queries vs long hooks around 0.46–0.50; BM25 plus query synonyms carry the rest. A per-request `min_cosine` overrides. |
+| `ASTORIA_GRAPH_MAX_DEPTH` | `2` | `retrieval/graph.py`, `store/graph.py`, `api/service.py` | Hops for graph expansion in recall and the default for `/graph` and `/edges?depth=`. `0` disables expansion. Hard cap 6. |
+| `ASTORIA_GRAPH_MAX_FANOUT` | `20` | same | Strongest edges followed per node per hop (cap 200). |
+| `ASTORIA_RECENCY_HALF_LIFE_DAYS` | `180.0` | `retrieval/recall.py` (`HALF_LIFE_DAYS`, refreshed on every recall) | Half-life of the recency term for **semantic** facts in recall and briefing scoring (`2^(−age/half_life)`, age from `last_seen`/`asserted_at`). Profile and procedural facts never decay in rank. |
+| `ASTORIA_BELIEF_HALF_LIFE_DAYS` | `60.0` | same | Recency half-life for `is_belief` facts in recall. |
+| `ASTORIA_EPISODIC_HALF_LIFE_DAYS` | `30.0` | same | Recency half-life for episodes in recall (age from `occurred_at`). |
+
+Candidate counts are constants: 40 vector + 40 BM25 fact candidates, 20 + 20 episode candidates
+(`recall.VEC_TOPN_*`, `BM25_TOPN_*`), RRF k = 60, at most 3 episodes shown; the score shape is
+`rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)`.
 
 ## 7. Trust and confidence
 
-| env | default | status | read by | meaning |
-|---|---|---|---|---|
-| `ASTORIA_CONFIDENCE_FLOOR` | `0.05` | wired | `store/facts.py`, `store/graph.py` | Lower clamp on any stored confidence. |
-| `ASTORIA_CONFIDENCE_CAP` | `0.98` | wired | same | Upper clamp; corroboration saturates towards it. |
-| `ASTORIA_CONFIDENCE_STAGING_THRESHOLD` | `0.35` | wired | `store/facts.py` | Extracted / imported / curator facts below this confidence land in `status='staging'` instead of `active`. |
-| `ASTORIA_TRUST_PRIOR_HUMAN` / `_DOC` / `_TOOL` / `_INFERRED` | `1.0` / `0.85` / `0.7` / `0.5` | reserved | — | Not read. Live trust caps are the code tables `CLIENT_TRUST`, `KIND_TRUST` and the per-kind default confidences `KIND_CONF` in `store/facts.py` (see ARCHITECTURE.md §6). |
+| env | default | read by | meaning |
+|---|---|---|---|
+| `ASTORIA_CONFIDENCE_FLOOR` | `0.05` | `store/facts.py`, `store/graph.py` | Lower clamp on any stored confidence. |
+| `ASTORIA_CONFIDENCE_CAP` | `0.98` | same | Upper clamp; corroboration saturates towards it. |
+| `ASTORIA_CONFIDENCE_STAGING_THRESHOLD` | `0.35` | `store/facts.py` | Extracted / imported / curator facts below this confidence land in `status='staging'` instead of `active`. |
+
+Trust caps are code tables (`CLIENT_TRUST`, `KIND_TRUST`) and the per-kind default confidences `KIND_CONF`
+in `store/facts.py` (see ARCHITECTURE.md §6).
 
 ## 8. Worker, curator and retention
 
-| env | default | status | read by | meaning |
-|---|---|---|---|---|
-| `ASTORIA_WORKER_ENABLED` | `true` | wired | `api/app.py` | Start the in-process worker loop (cognify drain, embed backfill, curator). Set `false` for API-only replicas or tests. |
-| `ASTORIA_COGNIFY_POLL_S` | `30.0` | wired | `cognify/worker.py` | Worker tick. Each tick: `embed_backfill` (200 facts + 200 episodes max), then a cognify drain. |
-| `ASTORIA_COGNIFY_BATCH` | `4` | wired | `cognify/worker.py` | Jobs claimed per tick (before coalescing by session). |
-| `ASTORIA_CURATOR_INTERVAL_MIN` | `60` | wired | `cognify/worker.py` | "Hourly" curator group: profile re-derive for users with changed profile facts + working-window turn archive. Floor 60 s. |
-| `ASTORIA_REFLECT_INTERVAL_H` | `6.0` | wired | `cognify/worker.py` | Reflection pass cadence (LLM). Floor 300 s. |
-| `ASTORIA_CURATOR_DAILY_H` | `24.0` | wired | `cognify/worker.py` | "Daily" group: `dedup_facts`, `decay`, `prune_snapshots`. Floor 3600 s. |
-| `ASTORIA_WORKING_WINDOW_TURNS` | `20` | wired | `curator.archive_old_turns` | Keep at most this many active `turn` episodes per session; older ones → `archived`. `0` disables the per-session cap. |
-| `ASTORIA_WORKING_WINDOW_HOURS` | `72` | wired | `curator.archive_old_turns` | Turns older than this leave working memory (→ `archived`). |
-| `ASTORIA_DECAY_ARCHIVE_THRESHOLD` | `0.08` | wired | `curator.decay` | Machine-sourced, never-recalled semantic facts with `decay_score` below this are archived. |
-| `ASTORIA_DECAY_MIN_AGE_DAYS` | `90` | wired | `curator.decay` | Only facts ingested longer ago than this are decay candidates. |
-| `ASTORIA_DEDUP_COSINE` | `0.93` | wired | `curator.dedup_facts` | Cosine between stored value embeddings above which two active set-values of one key are merged (or normalised containment). |
-| `ASTORIA_BACKUP_ENABLED` / `_HOUR_LOCAL` / `_KEEP` / `_DIR` | `true` / `3` / `14` / `/backups` | reserved | — | Not read by the service. Backups are the compose **sidecar** (`astoria-backup`) driven by `BACKUP_INTERVAL_S` and `BACKUP_KEEP` (compose environment, §9). |
+| env | default | read by | meaning |
+|---|---|---|---|
+| `ASTORIA_WORKER_ENABLED` | `true` | `api/app.py` | Start the in-process worker loop (cognify drain, embed backfill, curator). Set `false` for API-only replicas or tests. |
+| `ASTORIA_COGNIFY_POLL_S` | `30.0` | `cognify/worker.py` | Worker tick. Each tick: `embed_backfill` (200 facts + 200 episodes max), then a cognify drain. |
+| `ASTORIA_COGNIFY_BATCH` | `4` | `cognify/worker.py` | Jobs claimed per tick (before coalescing by session). |
+| `ASTORIA_CURATOR_INTERVAL_MIN` | `60` | `cognify/worker.py` | "Hourly" curator group: profile re-derive for users with changed profile facts + working-window turn archive. Floor 60 s. |
+| `ASTORIA_REFLECT_INTERVAL_H` | `6.0` | `cognify/worker.py` | Reflection pass cadence (LLM). Floor 300 s. |
+| `ASTORIA_CURATOR_DAILY_H` | `24.0` | `cognify/worker.py` | "Daily" group: `dedup_facts`, `decay`, `prune_snapshots`. Floor 3600 s. |
+| `ASTORIA_WORKING_WINDOW_TURNS` | `20` | `curator.archive_old_turns` | Keep at most this many active `turn` episodes per session; older ones → `archived`. `0` disables the per-session cap. |
+| `ASTORIA_WORKING_WINDOW_HOURS` | `72` | `curator.archive_old_turns` | Turns older than this leave working memory (→ `archived`). |
+| `ASTORIA_DECAY_ARCHIVE_THRESHOLD` | `0.08` | `curator.decay` | Machine-sourced, never-recalled semantic facts with `decay_score` below this are archived. |
+| `ASTORIA_DECAY_MIN_AGE_DAYS` | `90` | `curator.decay` | Only facts ingested longer ago than this are decay candidates. |
+| `ASTORIA_DECAY_HALF_LIFE_DAYS` | `90.0` | `curator.decay_score` | Recency half-life inside the **decay** (forgetting) score for non-belief facts — deliberately shorter than the ranking half-life: an unrecalled machine fact ages out of the active set faster than it drops in rank. |
+| `ASTORIA_DECAY_BELIEF_HALF_LIFE_DAYS` | `45.0` | `curator.decay_score` | Decay half-life for `is_belief` facts. |
+| `ASTORIA_DEDUP_COSINE` | `0.93` | `curator.dedup_facts` | Cosine between stored value embeddings above which two active set-values of one key are merged (or normalised containment). |
+
+Backups are not a service setting: the compose **sidecar** (`astoria-backup`) is driven by
+`BACKUP_INTERVAL_S` and `BACKUP_KEEP` (compose environment, §10).
 
 Fixed worker constants (`cognify/worker.py`): back-off 1, 5, 15, 60, 240 minutes; `max_attempts` 5 per
 queue row; groups of ≤ 8 episodes / ≤ 6000 chars per LLM call; `running` rows reclaimed after 30 min;
@@ -167,11 +176,14 @@ leader advisory lock id 43. Snapshot retention 90 days (`curator.prune_snapshots
 
 ## 9. Service process and logging
 
-| env | default | status | read by | meaning |
-|---|---|---|---|---|
-| `ASTORIA_LOG_LEVEL` | `INFO` | wired | `api/app.py` | Python logging level for the `astoria.*` loggers. Request log lines (JSON, stdout) are always emitted. |
-| `ASTORIA_VERSION` | `0.1.0` | wired | `api/app.py`, `/health`, `/` | Reported version string. |
-| `ASTORIA_HOST` / `ASTORIA_PORT` | `0.0.0.0` / `8933` | reserved | — | Not read by the application; the bind address comes from the `uvicorn` command line (`Dockerfile` CMD: `--host 0.0.0.0 --port 8933 --workers 1`). Run exactly one uvicorn worker per database unless you want several API processes sharing one worker leader (the advisory lock makes that safe, but only one drains the queue). |
+| env | default | read by | meaning |
+|---|---|---|---|
+| `ASTORIA_LOG_LEVEL` | `INFO` | `api/app.py` | Python logging level for the `astoria.*` loggers. Request log lines (JSON, stdout) are always emitted. |
+| `ASTORIA_VERSION` | `0.1.0` | `api/app.py`, `/health`, `/` | Reported version string. |
+
+The bind address is not a setting: it comes from the `uvicorn` command line (`Dockerfile` CMD: `--host
+0.0.0.0 --port 8933 --workers 1`). Run exactly one uvicorn worker per database unless you want several API
+processes sharing one worker leader (the advisory lock makes that safe, but only one drains the queue).
 
 ## 10. The compose stack (`deploy/nas/docker-compose.yml`)
 
@@ -191,10 +203,11 @@ optional `ASTORIA_CLIENT_TOKENS` / `ANTHROPIC_API_KEY`, and keep it out of versi
 
 | env | used by | meaning |
 |---|---|---|
-| `ASTORIA_URL` | `astoria` CLI, tests, `scripts/smoke.sh`, `scripts/bench/*` | Service base URL (e.g. `http://nas.local:8933`). |
+| `ASTORIA_URL` | `astoria` CLI, tests, `scripts/smoke.sh`, `scripts/bench/*`, `deploy.sh` health check | Service base URL (CLI default `http://localhost:8933`). |
+| `ASTORIA_NAS_SSH`, `ASTORIA_NAS_DIR` | `deploy/nas/deploy.sh` (from the gitignored `deploy/nas/deploy.env`) | ssh host alias (default `nas`) and deploy directory (default `/opt/astoria`) for the reference tar-over-ssh deploy script. |
 | `ASTORIA_TOKEN` | CLI | Bearer token sent as `Authorization: Bearer …`; maps to a client name server-side. |
-| `ASTORIA_USER` | CLI | Default `user_id` for every CLI call. |
-| `ASTORIA_DB_DSN` (or `ASTORIA_DSN`) | tests | Store-level tests and the "reach under the API" acceptance tests. |
+| `ASTORIA_USER` | CLI | Default `user_id` for every CLI call; empty (the default) = the server applies `ASTORIA_USER_DEFAULT`. |
+| `ASTORIA_DB_DSN` (or `ASTORIA_DSN`) | tests (also read from a repo-local `.env`) | Store-level tests and the "reach under the API" acceptance tests. |
 | `ASTORIA_DIRECT_DB` | tests | Force (`1`) or forbid (`0`) direct-DB variants of acceptance tests. |
 | `ASTORIA_RUN_SLOW` | tests | Run the `slow` scale test (T7). |
 | `TEI_URL`, `BENCH_DSN`, `BENCH_DB_EXEC`, `BENCH_SSH`, `BENCH_OUT`, `BENCH_LABEL` | `scripts/bench/*` | Benchmark harness (see `scripts/bench/README.md`). |
@@ -210,16 +223,17 @@ ASTORIA_USER_DEFAULT=alice
 ASTORIA_CLIENT_TOKENS=cli:<random>,assistant:<random>
 ASTORIA_REQUIRE_TOKEN=false
 
-# embeddings: fastest first, always-on last (same model on both!)
-ASTORIA_EMBED_URLS=http://gpu-box.local:4000|nomic-embed-text-v1.5,http://nas.local:8931|nomic
+# embeddings: one endpoint, or a priority list (fastest first, always-on last — same model on both!)
+ASTORIA_EMBED_URL=http://embedder.local:8931
+# ASTORIA_EMBED_URLS=http://gpu-box.local:4000|nomic-embed,http://embedder.local:8931|nomic
 ASTORIA_EMBED_SYNC=false
 
-# optional reranker (empty string disables the stage)
-ASTORIA_RERANK_URLS=http://nas.local:8935|cross-encoder/ms-marco-MiniLM-L-6-v2
+# optional reranker (unset/empty = stage off)
+# ASTORIA_RERANK_URLS=http://nas.local:8935|cross-encoder/ms-marco-MiniLM-L-6-v2
 
 # LLM for cognify / curator / resolve
-ASTORIA_LLM_URL=http://llm-gateway.local:4000/v1
-ASTORIA_LLM_MODEL=<model served by the gateway>
+ASTORIA_LLM_URL=http://gateway.local:4000/v1
+ASTORIA_LLM_MODEL=auto
 # ANTHROPIC_API_KEY=...            # enables the direct fallback
 
 ASTORIA_LOG_LEVEL=INFO

@@ -9,8 +9,8 @@ every command.
 
 ```bash
 pip install .                                     # or: pipx install .
-export ASTORIA_URL=http://nas.local:8933          # service base URL
-export ASTORIA_USER=alice                         # default user_id for every call
+export ASTORIA_URL=http://nas.local:8933          # service base URL (default http://localhost:8933)
+export ASTORIA_USER=alice                         # optional: user_id for every call (default: the server's ASTORIA_USER_DEFAULT)
 export ASTORIA_TOKEN=<token>                      # optional: bearer token → client name + trust cap server-side
 astoria status                                    # db / embeddings / llm / rerank / queue at a glance
 ```
@@ -18,7 +18,7 @@ astoria status                                    # db / embeddings / llm / rera
 | env | CLI flag | meaning |
 |---|---|---|
 | `ASTORIA_URL` | `--url` | service base URL |
-| `ASTORIA_USER` | `--user / -u` | `user_id` every request is scoped to |
+| `ASTORIA_USER` | `--user / -u` | `user_id` every request is scoped to; empty → the server applies `ASTORIA_USER_DEFAULT` |
 | `ASTORIA_TOKEN` | `--token` | `Authorization: Bearer …`; without it the CLI sends `X-Astoria-Client: cli` |
 | — | `--json / -j` | raw JSON instead of tables (for `jq`) |
 | — | `--timeout` | HTTP timeout (30 s) |
@@ -28,10 +28,7 @@ request (4xx) · `5` the service failed (5xx). Short fact ids (the first 8 chara
 accepted wherever an id is expected; dates accept `YYYY-MM-DD`, ISO-8601, or `now` / `today` /
 `yesterday` / `3 days ago` / `2 weeks ago`.
 
-> The shipped defaults for `--url` and `--user` (and the example subject names in the built-in help)
-> come from the reference deployment; set `ASTORIA_URL` / `ASTORIA_USER` and read the examples with your
-> own names. The help text below was generated with `COLUMNS=100` and those two values replaced by
-> placeholders.
+> The help text below was generated with `COLUMNS=100` from the installed command.
 
 ## 2. Workflows
 
@@ -199,7 +196,7 @@ $A wipe-user $U --yes --force
    astoria alias add ws1 workstation-1       → two names, one subject
 
  Environment
-   ASTORIA_URL    service base URL   (default http://nas.local:8933)
+   ASTORIA_URL    service base URL   (default http://localhost:8933)
    ASTORIA_TOKEN  bearer token → client name server-side (sent as Authorization: Bearer)
    ASTORIA_USER   default user_id    (default alice)
 
@@ -210,10 +207,8 @@ $A wipe-user $U --yes --force
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
 │ --user                -u      <str>    user_id every request is scoped to.                       │
 │                                        [env var: ASTORIA_USER]                                   │
-│                                        [default: alice]                                           │
-│ --url                         <str>    Service base URL.                                         │
-│                                        [env var: ASTORIA_URL]                                    │
-│                                        [default: http://nas.local:8933]                      │
+│ --url                         <str>    Service base URL.                [env var: ASTORIA_URL]   │
+│                                        [default: http://localhost:8933]                          │
 │ --token                       <str>    Bearer token (maps to a client name and trust cap         │
 │                                        server-side).                                             │
 │                                        [env var: ASTORIA_TOKEN]                                  │
@@ -431,10 +426,10 @@ $A wipe-user $U --yes --force
  astoria remember alice uses_tool Neovim --set
  astoria remember alice lives_in Portland --from 2024-06-01
  astoria remember alice employer Acme --from 2019-01-01 --to 2023-12-31 --historical
- astoria remember --text "Alice prefers dark mode and tabs over spaces"
+ astoria remember --text "Rick prefers dark mode and tabs over spaces"
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
-│   subject        <str>  Subject ('alice' / 'I' / 'me' → the user).                                │
+│   subject        <str>  Subject ('alice' / 'I' / 'me' → the user).                               │
 │   predicate      <str>  snake_case predicate, e.g. favorite_beer.                                │
 │   value          <str>  Value text.                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -468,7 +463,7 @@ $A wipe-user $U --yes --force
 
  Examples:
  astoria resolve "forget the beer stuff"
- astoria resolve "actually I moved to Portland" --apply
+ astoria resolve "actually I moved to Oakland" --apply
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
 │ *    text      <str>  Natural-language memory instruction. [required]                            │
@@ -493,10 +488,10 @@ $A wipe-user $U --yes --force
 
  Examples:
  astoria correct alice favorite_beer Stout
- astoria correct "actually I live in Portland"
+ astoria correct "actually I live in Oakland"
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
-│ *    subject        <str>  Subject — or a free-text correction ("actually I live in Portland")    │
+│ *    subject        <str>  Subject — or a free-text correction ("actually I live in Oakland")    │
 │                            when no PREDICATE follows.                                            │
 │                            [required]                                                            │
 │      predicate      <str>  Predicate.                                                            │
@@ -889,7 +884,7 @@ $A wipe-user $U --yes --force
  Examples:  astoria graph buildbot  ·  astoria graph workstation-1 --depth 1
 
 ╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
-│ *    node      <str>  Entity name (e.g. buildbot), 'entity:NAME' or 'fact:UUID'. [required]        │
+│ *    node      <str>  Entity name (e.g. buildbot), 'entity:NAME' or 'fact:UUID'. [required]      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
 │ --depth   -d      <int range> [0<=x<=6]  Hops to walk (undirected). [default: 2]                 │

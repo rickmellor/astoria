@@ -210,8 +210,9 @@ function, inside a transaction:
 `retract` closes belief (`status='retracted'`, `expired_at=now`) for a fact id or a `(subject, predicate[,
 value])` key and tombstones each closed triple. `forget` archives (`soft`) or deletes (`hard`) one row and
 tombstones it. `update_fact` edits `value, confidence, importance, tags, layer, valid_from, valid_to,
-asserted_at, is_belief, ref, status (active|archived|staging), evidence, detail` by id and re-embeds when
-the value changed. `approve_staging` promotes a staging row through the normal supersede path as an
+asserted_at, is_belief, ref, status (active|archived|staging), evidence, detail` by id; a changed value
+re-renders the hook and, like every other write, embeds inline only when `ASTORIA_EMBED_SYNC=true`
+(otherwise the embedding is nulled and backfilled). `approve_staging` promotes a staging row through the normal supersede path as an
 explicit assertion (confidence ≥ 0.8) and archives the staging row.
 
 ### 4.3 Cognify (LLM at write; `cognify/`)
@@ -270,7 +271,7 @@ and the CLI (`astoria resolve`, `astoria forget "<text>"`). It is never on the c
 | `archive_old_turns` | hourly group | no | working-memory window: active `turn` episodes older than `working_window_hours` or beyond the newest `working_window_turns` per session → `archived` |
 | `reflect` | every `reflect_interval_h` | yes (`prompts/reflect.md`) | ≤ 5 higher-order insights over the last 7 days of unreflected summary/note episodes, written as beliefs (`source_kind='curator'`, `is_belief=true`, confidence ≤ 0.6 — the staging gate applies), `embedding NULL` (backfilled); episodes marked `meta.reflected` |
 | `dedup_facts` | daily group | no | merges near-duplicate **active set values** of one key (cosine ≥ `dedup_cosine` on stored embeddings, or normalised containment): keeps the human-stated / richer / newer row, folds usage counters into it, retracts the other with reason `curator-dedup` (a non-blocking tombstone) |
-| `decay` | daily group | no | archives **machine-sourced** (`extracted`, `curator`, `imported`), never-recalled (`access_count=0`) **semantic** facts older than `decay_min_age_days` whose `decay_score = importance × (1+ln(1+access_count)) × source_trust × 2^(−age/half_life)` is below `decay_archive_threshold`; never explicit/detector rows, never profile/procedural |
+| `decay` | daily group | no | archives **machine-sourced** (`extracted`, `curator`, `imported`), never-recalled (`access_count=0`) **semantic** facts older than `decay_min_age_days` whose `decay_score = importance × (1+ln(1+access_count)) × source_trust × 2^(−age/half_life)` (half-life `decay_half_life_days`, or `decay_belief_half_life_days` for beliefs) is below `decay_archive_threshold`; never explicit/detector rows, never profile/procedural |
 | `prune_snapshots` | daily group | no | deletes recall snapshots older than 90 days |
 
 Every pass is idempotent, re-verifies its targets inside the transaction right before writing, takes
@@ -328,8 +329,9 @@ query ─► embed (query prefix) ─► candidates ─► RRF ─► weight ─
    With `as_of`, fact candidates come from `facts.as_of` (valid axis, optional belief axis) ranked by BM25
    only.
 3. **RRF** `Σ 1/(60 + rank)` over the lists an item appears in; then `score = rrf × (0.25 + 0.25·recency +
-   0.25·importance + 0.25·trust)` with recency `2^(−age/half_life)` — episodic 30 d, semantic 180 d,
-   beliefs 60 d, profile/procedural none; episode trust fixed at 0.6.
+   0.25·importance + 0.25·trust)` with recency `2^(−age/half_life)` — half-lives from settings
+   (`episodic_half_life_days` 30, `recency_half_life_days` 180 for semantic facts, `belief_half_life_days`
+   60), profile/procedural none; episode trust fixed at 0.6.
 4. **Graph expansion** (current-time recalls only, `graph_max_depth > 0`): the top-10 fact candidates and
    the entities they are about seed a bounded walk over active edges (`retrieval/graph.expand_candidates`):
    facts reached over edges, and facts *about* reached entities (the user hub is skipped) join the pool
@@ -402,10 +404,10 @@ REST still comes up with MCP disabled (logged). Request log = JSON lines on stdo
 - **Heuristic, not learned.** The regex detector covers a handful of English patterns; the BM25 synonym
   map is a small hand-written table; trust caps and decay weights are constants. They are deliberately
   simple and auditable, and they are where tuning will happen next.
-- **Several `Settings` knobs are reserved, not wired** (`recall_limit`, `recall_token_budget`,
-  `recall_min_score`, `vector_candidates`, `fts_candidates`, `w_*`, `contiguity_boost`, `trust_prior_*`,
-  `backup_*`, `host`/`port`); the live values are the module constants listed in CONFIGURATION.md. Recall's
-  half-lives are constants; the `*_half_life_days` settings govern the curator's decay only.
+- **Some retrieval shape is constant, not configurable**: candidate counts (40 ⊕ 40 facts, 20 ⊕ 20
+  episodes), RRF k, the additive score shape and its 0.25 weights, the episode cap of 3. Half-lives,
+  default `limit`/`max_tokens`, cosine floor, graph bounds and reranker parameters are settings
+  (CONFIGURATION.md).
 - **Extraction and reflection are only as good as the LLM and the prompts**; the guards (staging gate,
   trust guard, tombstones, near-duplicate guard, candidate-id validation) bound the damage, they do not
   remove the dependency.

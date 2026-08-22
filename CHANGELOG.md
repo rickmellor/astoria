@@ -44,6 +44,18 @@ documented in `docs/CONTRACT.md`. Entries are feature-level; see git history for
 - Tests: belief axis, graph, targets, rerank, curator, concurrency; acceptance suite T1–T12.
 
 ### Changed
+- **Generic configuration**: defaults point at `localhost` (`ASTORIA_EMBED_URL`, `ASTORIA_LLM_URL`),
+  `ASTORIA_USER_DEFAULT=default`, `ASTORIA_LLM_MODEL=auto`, `ASTORIA_EMBED_URLS` / `ASTORIA_RERANK_URLS`
+  empty (priority list optional; reranker off unless configured); settings also load a repo-local `.env`.
+  Wired `ASTORIA_RECALL_LIMIT` / `ASTORIA_RECALL_TOKEN_BUDGET` (recall defaults), the recall half-lives
+  (`RECENCY_` 180 d semantic, `BELIEF_` 60 d, new `EPISODIC_` 30 d) and new curator decay half-lives
+  (`DECAY_HALF_LIFE_DAYS` 90, `DECAY_BELIEF_HALF_LIFE_DAYS` 45). Removed never-read knobs
+  (`recall_min_score`, `vector_candidates`, `fts_candidates`, `w_*`, `contiguity_boost`, `trust_prior_*`,
+  `backup_*`, `host`, `port`). `/health` reports `user_default`.
+- MCP tools default `user_id=""` (server default applies); CLI defaults `ASTORIA_URL=http://localhost:8933`
+  and an empty `ASTORIA_USER`; `deploy.sh` reads site values from a gitignored `deploy/nas/deploy.env`;
+  `.env.example` rewritten generic; seed predicate `default_profile`; neutral example names in prompts/CLI.
+- `update_fact` honours `ASTORIA_EMBED_SYNC` (a changed value is backfilled instead of embedded inline).
 - Working-memory window default 72 h / 20 turns per session (was 14 days).
 - Recall reports `health.rerank` alongside `health.tei` / `degraded`.
 
