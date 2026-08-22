@@ -212,6 +212,16 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
         status = status_override or "active"
         if status == "active" and source_kind in ("extracted", "imported", "curator") and conf < s.confidence_staging_threshold:
             status = "staging"
+        # trust guard: a machine-extracted/imported/curated value must NEVER silently override a
+        # human-stated (explicit/detector) active value on a FUNCTIONAL key — it lands in staging
+        # as a flagged conflict for review (approve_staging promotes it explicitly).
+        if (status == "active" and active is not None and card == "functional"
+                and source_kind in ("extracted", "imported", "curator")
+                and active.get("source_kind") in ("explicit", "detector")):
+            status = "staging"
+            meta["conflict_with"] = str(active["id"])
+            _audit(cur, user_id, actor, "conflict_staged", None,
+                   {"subject": subject, "predicate": predicate, "value": value, "active": str(active["id"])})
         if embed and vec is None:  # pre-check guessed NOOP but the locked read disagreed (rare race)
             vec = embed_one(hook)
 
