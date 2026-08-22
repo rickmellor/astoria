@@ -22,7 +22,7 @@ You are given:
 
 1. **Subject.** First person ("I", "me", "my", "we" when it means the user, the user's own name)
    → subject is exactly USER_ID. Other subjects are lower-case, short, literal names
-   (`specul8-o-matic`, `johnny`, `project astoria`); reuse the exact subject spelling from
+   (`workstation-1`, `buildbot`, `project astoria`); reuse the exact subject spelling from
    CANDIDATE FACTS whenever the text refers to the same thing.
 2. **Predicate.** snake_case. Prefer a REGISTRY name when one fits; only invent a new one when
    nothing fits, and make it generic and reusable (`uses_tool`, not `uses_neovim`). Use
@@ -73,7 +73,7 @@ You are given:
     (counting from 1) when one fact belongs to / elaborates another. Never invent relations; when in
     doubt emit no edge. Same `confidence` scale as facts.
 16. **`aliases`** (optional, usually empty). Only when the text CLEARLY says two names denote the
-    same thing — a rename ("johnny is now called nova"), an "aka"/"a.k.a.", "formerly", or an
+    same thing — a rename ("buildbot is now called nova"), an "aka"/"a.k.a.", "formerly", or an
     abbreviation the user defines ("the NAS (ugreen-dxp4800)"): `{"alias": "<other name>",
     "canonical": "<name to keep>"}`, both lower-case; prefer the candidate-list spelling as canonical.
     Never alias the user themself, and never guess from mere similarity.
@@ -139,7 +139,7 @@ You are given:
 
 `edges` and `aliases` may be omitted or `[]` — most exchanges have none.
 
-Example (USER_ID `rick`, candidate `7f…` = `rick favorite_beer Guinness`):
+Example (USER_ID `alice`, candidate `7f…` = `alice favorite_beer Guinness`):
 
 TEXT: `Actually my favorite beer is IPA, not Guinness. I live in El Cerrito.`
 
@@ -147,20 +147,20 @@ TEXT: `Actually my favorite beer is IPA, not Guinness. I live in El Cerrito.`
 {"summary": "Rick's favorite beer is IPA (not Guinness) and he lives in El Cerrito.",
  "nothing_durable": false,
  "facts": [
-  {"subject": "rick", "predicate": "favorite_beer", "value": "IPA", "layer": "profile",
+  {"subject": "alice", "predicate": "favorite_beer", "value": "IPA", "layer": "profile",
    "is_belief": false, "confidence": 0.85, "valid_from": null, "valid_to": null,
    "action": "assert", "contradicts": ["7f…"], "evidence": "my favorite beer is IPA, not Guinness"},
-  {"subject": "rick", "predicate": "location", "value": "El Cerrito", "layer": "profile",
+  {"subject": "alice", "predicate": "location", "value": "El Cerrito", "layer": "profile",
    "is_belief": false, "confidence": 0.85, "valid_from": null, "valid_to": null,
    "action": "assert", "contradicts": [], "evidence": "I live in El Cerrito"}
  ],
  "edges": [], "aliases": []}
 ```
 
-Edge/alias example — TEXT: `johnny (the inference manager, now renamed nova) runs on specul8-o-matic.`
-→ facts `[{"subject": "nova", "predicate": "runs_on", "value": "specul8-o-matic", ...}]`,
-`"edges": [{"src": "nova", "relation": "runs_on", "dst": "specul8-o-matic", "confidence": 0.85,
-"evidence": "runs on specul8-o-matic"}]`, `"aliases": [{"alias": "johnny", "canonical": "nova",
+Edge/alias example — TEXT: `buildbot (the inference manager, now renamed nova) runs on workstation-1.`
+→ facts `[{"subject": "nova", "predicate": "runs_on", "value": "workstation-1", ...}]`,
+`"edges": [{"src": "nova", "relation": "runs_on", "dst": "workstation-1", "confidence": 0.85,
+"evidence": "runs on workstation-1"}]`, `"aliases": [{"alias": "buildbot", "canonical": "nova",
 "evidence": "now renamed nova"}]`.
 
 Reply with the JSON object only.

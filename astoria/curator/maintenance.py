@@ -416,14 +416,14 @@ def _access_factor(n: int) -> float:
 
 def decay_score(row: dict, *, now: datetime | None = None) -> float:
     """score = importance × f(access_count) × source_trust × recency; recency = 2^(−age/half_life) with age from
-    last_seen (insert or last touch) and half_life = belief_half_life_days for beliefs else recency_half_life_days."""
+    last_seen (insert or last touch) and half_life = decay_belief_half_life_days for beliefs else decay_half_life_days."""
     st = settings()
     now = now or datetime.now(UTC)
     seen = row.get("last_seen") or row.get("ingested_at") or now
     if seen.tzinfo is None:
         seen = seen.replace(tzinfo=UTC)
     age_days = max(0.0, (now - seen).total_seconds() / 86400.0)
-    half = float(st.belief_half_life_days if row.get("is_belief") else st.recency_half_life_days) or 1.0
+    half = float(st.decay_belief_half_life_days if row.get("is_belief") else st.decay_half_life_days) or 1.0
     recency = math.pow(2.0, -age_days / half)
     return float(row.get("importance") or 0) * _access_factor(row.get("access_count") or 0) \
         * float(row.get("source_trust") or 0) * recency

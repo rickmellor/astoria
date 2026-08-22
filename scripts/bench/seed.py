@@ -303,7 +303,36 @@ def print_sizes(s: dict) -> None:
         print(f"| {k} | {v} |")
 
 
-WIPE_TABLES = ("snapshot", "cognify_queue", "tombstone", "profile_history", "profile", "audit", "fact", "episode")
+WIPE_TABLES = ("snapshot", "cognify_queue", "tombstone", "profile_history", "profile", "audit", "edge", "entity", "alias",
+               "fact", "episode")
+
+
+def seed_edges(c, user_id: str, n: int) -> dict:
+    """n random ACTIVE edges for one bench user so recall's graph expansion has something to walk:
+    fact→entity (the fact's subject links to another entity, relation related_to) and entity→entity
+    (part_of). Subjects of that user's active facts are the entity nodes. Returns counts + seconds."""
+    if not user_id.startswith(BENCH_PREFIX):
+        raise SystemExit(f"refusing to touch non-bench user {user_id!r}")
+    rng = _rng(user_id + "|edges")
+    rows = c.execute("SELECT id::text, subject FROM fact WHERE user_id=%s AND status='active'", (user_id,)).fetchall()
+    ents = sorted({r[1] for r in rows if r[1] != user_id})
+    if len(rows) < 2 or len(ents) < 2:
+        return {"edges": 0, "reason": "not enough facts/entities"}
+    t0 = time.perf_counter()
+    vals = []
+    for i in range(n):
+        if rng.random() < 0.7:
+            f = rng.choice(rows); e = rng.choice(ents)
+            vals.append((user_id, "fact", f[0], "entity", e, "related_to", round(rng.uniform(0.3, 1.0), 2)))
+        else:
+            a, b = rng.sample(ents, 2)
+            vals.append((user_id, "entity", a, "entity", b, "part_of", round(rng.uniform(0.3, 1.0), 2)))
+    with c.cursor() as cur:
+        cur.executemany("INSERT INTO edge(user_id, src_kind, src_id, dst_kind, dst_id, relation, weight, source, source_kind, confidence) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,'bench','imported',0.6) ON CONFLICT DO NOTHING", vals)
+    c.commit()
+    n_db = c.execute("SELECT count(*) FROM edge WHERE user_id=%s AND status='active'", (user_id,)).fetchone()[0]
+    return {"edges": n_db, "entities": len(ents), "facts": len(rows), "seconds": round(time.perf_counter() - t0, 1)}
 
 
 def counts(c) -> dict:
@@ -337,6 +366,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sizes", action="store_true")
     ap.add_argument("--vacuum", action="store_true")
     ap.add_argument("--wipe", action="store_true")
+    ap.add_argument("--edges", type=int, default=0, help="insert N random active edges for --edges-user (graph-expansion cost probe)")
+    ap.add_argument("--edges-user", default=f"{BENCH_PREFIX}real")
     ap.add_argument("--out", default=os.environ.get("BENCH_OUT"), help="append JSON records (load/sizes/wipe) to this file")
     a = ap.parse_args(argv)
 
@@ -360,6 +391,11 @@ def main(argv=None) -> int:
         sz = sizes(c); print_sizes(sz)
         emit({"phase": "wipe", **r, "sizes": sz})
         return 0
+    if a.edges:
+        r = seed_edges(c, a.edges_user, a.edges)
+        print("edges:", r); emit({"phase": "edges", "user": a.edges_user, **r})
+        if not a.users:
+            return 0
     if not a.users:
         if a.vacuum:
             c.rollback(); c.autocommit = True

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "astoria"
 version = "0.1.0"
-description = "Astoria — Nova's layered, trusted, scalable, deep memory service (NAS-hosted, Postgres+pgvector, REST+MCP)."
+description = "Astoria — layered, trusted, scalable, deep memory for AI agents (Postgres+pgvector, REST+MCP)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

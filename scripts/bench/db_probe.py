@@ -9,7 +9,8 @@ It also works locally (BENCH_DSN) for dev setups where Postgres is reachable dir
 
 Payload ops (all return one JSON object on the LAST stdout line):
   {"op": "recall", "user_id", "queries": [[text, vec|null], ...], "session_id"?, "limit"?,
-   "modes": ["off", "relaxed_order"], "repeat": 1}          → per mode: lat_ms[], items' predicates,
+   "modes": ["off", "relaxed_order"], "repeat": 1, "rerank": false}
+                                                             → per mode: lat_ms[], items' predicates,
                                                              vector candidates-of-40 per query, hnsw gucs
   {"op": "recall_concurrent", "user_id", "queries", "clients": [1,4,8], "seconds": 20}
                                                              → DB-only recall with N parallel connections
@@ -47,6 +48,15 @@ def _recall_mod():
     return R
 
 
+def _rerank_kw(R, p: dict) -> dict:
+    """DB-only = the store alone: the cross-encoder stage is OFF unless the payload says {"rerank": true}
+    (only when the deployed recall() has the parameter)."""
+    import inspect
+    if "rerank" not in inspect.signature(R.recall).parameters:
+        return {}
+    return {"rerank": bool(p.get("rerank", False))}
+
+
 def _pct(xs, p):
     s = sorted(xs)
     if not s:
@@ -79,7 +89,7 @@ def op_recall(c, R, p: dict) -> dict:
             for q, vec in qs:
                 R.embed_one = lambda text, query=True, _v=vec: _v
                 t = time.perf_counter()
-                res = R.recall(c, user_id=u, query=q, session_id=sid, limit=limit)
+                res = R.recall(c, user_id=u, query=q, session_id=sid, limit=limit, **_rerank_kw(R, p))
                 c.commit()
                 lats.append((time.perf_counter() - t) * 1000)
                 preds.append([it.get("predicate") for it in res["items"]])
@@ -121,7 +131,7 @@ def op_recall_concurrent(c, R, p: dict) -> dict:
                 RR.embed_one = lambda text, query=True, _v=vec: _v
                 t = time.perf_counter()
                 try:
-                    RR.recall(cc, user_id=u, query=q, limit=12); cc.commit()
+                    RR.recall(cc, user_id=u, query=q, limit=12, **_rerank_kw(RR, p)); cc.commit()
                 except Exception:  # noqa: BLE001
                     cc.rollback()
                     with lock:
@@ -158,6 +168,11 @@ def op_breakdown(c, R, p: dict) -> dict:
             now = R._now()
             fr = T("score+collapse(py)", lambda: R._score_facts(R._rrf(fv, fb), now))
             sel = fr[:12]
+            try:   # graph expansion (bounded walk from the top-10 seeds + facts about their subjects) — present since 003
+                from astoria.retrieval.graph import expand_candidates
+                T("graph_expand(sql)", lambda: expand_candidates(c, u, [r["id"] for r in fr[:10]]))
+            except Exception:  # noqa: BLE001
+                pass
             if sel:
                 T("stale_hints(sql)", lambda: R._stale_hints(c, u, sel))
             T("snapshot+touch(sql)", lambda: (

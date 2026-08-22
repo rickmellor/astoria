@@ -21,6 +21,16 @@ Phases (positional):
                             filter, iterative_scan off vs relaxed_order (run on a bench-uNN, not bench-real)
   worker    USER [--turns 100] [--seconds 60]   enqueue cognify=true turns; recall p95 while the worker drains
   wipe-http USER            DELETE /users/{USER} (the REST wipe path)
+  embed-floor               query-embed latency per embedding endpoint (workstation seat via SAINT vs NAS TEI), 1/4/8-way
+  rerank-floor              cross-encoder latency per reranker endpoint (30 hooks/request), 1/4/8-way
+  embed-gap USER [--n 20]   async write path: capture N turns + POST N facts, then poll until the worker has
+                            embedded them (time-to-embedded = the recall gap of the async write path)
+  correct-seq USER [--n 50] N sequential POST /correct on ONE functional key (the API-built supersede chain
+                            with belief-axis versioning) → latency, rows per supersede, /history, /as_of
+
+Global flags: --rerank on|off (adds `rerank: true|false` to every /recall body; default = service setting),
+              --unique (append a per-call nonce to recall queries so the service's query-embed / rerank LRU
+              caches never hit — the cold-path number; default re-uses the 30 fixed queries = warm caches).
 
 Environment: ASTORIA_URL, BENCH_DSN (DB-only phases), TEI_URL, BENCH_SSH — see common.py.
 """
@@ -44,6 +54,39 @@ from common import (ASTORIA_URL, BENCH_DSN, BENCH_PREFIX, QUERIES, REAL_QUERIES,
                     fmt_row, oom_events, real_facts, summarize, tei_embed)
 
 HDR = {"X-Astoria-Client": "bench"}
+RERANK: bool | None = None       # --rerank on|off → every /recall body carries rerank: true|false
+UNIQUE = False                   # --unique → nonce per recall query (defeats the service's embed/rerank caches)
+_NONCE = [int(time.time() * 1000) % 10**7]
+_NONCE_LOCK = threading.Lock()
+EMBED_ENDPOINTS = os.environ.get("BENCH_EMBED_ENDPOINTS",
+                                 "workstation=http://192.168.1.221:4000|saint-local-embed,nas=http://192.168.1.134:8931|nomic")
+RERANK_ENDPOINTS = os.environ.get("BENCH_RERANK_ENDPOINTS",
+                                  "workstation=http://192.168.1.221:8935,nas=http://192.168.1.134:8935")
+
+
+def _recall_body(u: str, q: str, **extra) -> dict:
+    """/recall body honoring --rerank / --unique."""
+    if UNIQUE:
+        with _NONCE_LOCK:
+            _NONCE[0] += 1
+            q = f"{q} #{_NONCE[0]}"
+    body = {"user_id": u, "query": q, "limit": 12, **extra}
+    if RERANK is not None:
+        body["rerank"] = RERANK
+    return body
+
+
+def _parse_endpoints(spec: str) -> list[tuple[str, str, str]]:
+    """'name=url|model,name=url' → [(name, url, model)]"""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, rest = part.partition("=")
+        url, _, model = rest.partition("|")
+        out.append((name.strip(), url.strip().rstrip("/"), model.strip()))
+    return out
 
 
 def _client(timeout: float = 60.0) -> httpx.Client:
@@ -77,8 +120,10 @@ def _timed(fn) -> tuple[bool, float]:
 # DB-only probe: runs scripts/bench/db_probe.py INSIDE the service container (BENCH_DB_EXEC) so the
 # numbers exclude the ssh tunnel; falls back to running it locally against BENCH_DSN.
 
-BENCH_DB_EXEC = os.environ.get("BENCH_DB_EXEC", "ssh -o BatchMode=yes root-dxp4800gt docker exec -i astoria python -"
-                               if not os.environ.get("BENCH_DSN") else "")
+# Default: ALWAYS in-container (a BENCH_DSN export for seed.py must not silently move the DB-only probe onto the
+# ssh tunnel — that path adds 40-100 ms per vector query and once produced 375 ms "DB-only" recalls that were
+# really 30 ms). Set BENCH_DB_EXEC="" explicitly to run the probe locally against BENCH_DSN.
+BENCH_DB_EXEC = os.environ.get("BENCH_DB_EXEC", "ssh -o BatchMode=yes root-dxp4800gt docker exec -i astoria python -")
 PROBE_SRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_probe.py")).read()
 
 
@@ -149,31 +194,37 @@ def phase_baseline(a) -> dict:
     with _client() as cl:
         lat, err = [], 0
         for q in QUERIES:
-            ok, ms = _timed(lambda: cl.post("/recall", json={"user_id": u, "query": q, "limit": 12}).status_code == 200)
+            ok, ms = _timed(lambda: cl.post("/recall", json=_recall_body(u, q)).status_code == 200)
             lat.append(ms); err += (not ok)
-        res["recall_e2e"] = summarize(lat, err)
-        lat, err = [], 0
-        tag = f"base{int(time.time())}"   # unique per run: identical text would hit the idem_key DEDUPE path (~6 ms, no embed)
-        for i in range(30):
-            body = {"user_id": u, "kind": "turn", "session_id": f"{u}-{tag}", "cognify": False,
-                    "user_input": f"{tag} turn {i}: what did we decide about {QUERIES[i % len(QUERIES)]}?",
-                    "agent_response": "We decided to measure it first and keep the NAS as the permanent store."}
-            ok, ms = _timed(lambda: cl.post("/capture", json=body).status_code == 200)
-            lat.append(ms); err += (not ok)
-        res["capture"] = summarize(lat, err)
-        lat, err, actions = [], 0, {}
-        tag = f"base{int(time.time())}"
-        for i in range(30):   # novel set-facts → the real insert path (TEI embed + supersede check + insert)
-            body = {"user_id": u, "subject": f"bench-ent-{i:03d}", "predicate": "bench_attr_00",
-                    "value": f"{tag} {QUERIES[i % len(QUERIES)]} #{i}"}
-            t = time.perf_counter()
-            try:
-                r = cl.post("/facts", json=body); ok = r.status_code == 200
-                act = r.json().get("action") if ok else f"http{r.status_code}"
-            except Exception as e:  # noqa: BLE001
-                ok, act = False, type(e).__name__
-            lat.append((time.perf_counter() - t) * 1000); err += (not ok); actions[act] = actions.get(act, 0) + 1
-        res["facts_post"] = summarize(lat, err); res["facts_post_actions"] = actions
+        res["recall_e2e"] = summarize(lat, err); res["rerank"] = RERANK; res["unique"] = UNIQUE
+        for variant, sync in (("capture", None), ("capture_sync", True)):
+            lat, err = [], 0
+            tag = f"base{int(time.time() * 1000)}"   # unique per run: identical text would hit the idem_key DEDUPE path (~6 ms, no embed)
+            for i in range(30):
+                body = {"user_id": u, "kind": "turn", "session_id": f"{u}-{tag}", "cognify": False,
+                        "user_input": f"{tag} turn {i}: what did we decide about {QUERIES[i % len(QUERIES)]}?",
+                        "agent_response": "We decided to measure it first and keep the NAS as the permanent store."}
+                if sync is not None:
+                    body["sync"] = sync
+                ok, ms = _timed(lambda: cl.post("/capture", json=body).status_code == 200)
+                lat.append(ms); err += (not ok)
+            res[variant] = summarize(lat, err)
+        for variant, sync in (("facts_post", None), ("facts_post_sync", True)):
+            lat, err, actions = [], 0, {}
+            tag = f"base{int(time.time() * 1000)}"
+            for i in range(30):   # novel set-facts → the real insert path (embed [sync] + supersede check + insert)
+                body = {"user_id": u, "subject": f"bench-ent-{i:03d}", "predicate": "bench_attr_00",
+                        "value": f"{tag} {QUERIES[i % len(QUERIES)]} #{i}"}
+                if sync is not None:
+                    body["sync"] = sync
+                t = time.perf_counter()
+                try:
+                    r = cl.post("/facts", json=body); ok = r.status_code == 200
+                    act = r.json().get("action") if ok else f"http{r.status_code}"
+                except Exception as e:  # noqa: BLE001
+                    ok, act = False, type(e).__name__
+                lat.append((time.perf_counter() - t) * 1000); err += (not ok); actions[act] = actions.get(act, 0) + 1
+            res[variant] = summarize(lat, err); res[variant + "_actions"] = actions
     # DB-only recall (probe inside the service container)
     qs, tei_lat = _embed_queries(QUERIES)
     res["tei_query_embed"] = summarize(tei_lat)
@@ -181,7 +232,7 @@ def phase_baseline(a) -> dict:
     res["recall_db_only"] = _mode_summary(pr["modes"]["off"])
     res["gucs"] = pr["gucs_before"]
     print(TABLE_HEADER)
-    for k in ("recall_e2e", "recall_db_only", "tei_query_embed", "capture", "facts_post"):
+    for k in ("recall_e2e", "recall_db_only", "tei_query_embed", "capture", "capture_sync", "facts_post", "facts_post_sync"):
         print(fmt_row(k, res[k]))
     return res
 
@@ -233,7 +284,7 @@ def phase_recall(a) -> dict:
         for q in qs_text:
             t = time.perf_counter()
             try:
-                r = cl.post("/recall", json={"user_id": u, "query": q, "limit": 12})
+                r = cl.post("/recall", json=_recall_body(u, q))
                 ok = r.status_code == 200
                 if ok:
                     for rq, pred in REAL_QUERIES:
@@ -242,7 +293,7 @@ def phase_recall(a) -> dict:
             except Exception:  # noqa: BLE001
                 ok = False
             lat.append((time.perf_counter() - t) * 1000); err += (not ok)
-    res["e2e"] = summarize(lat, err)
+    res["e2e"] = summarize(lat, err); res["rerank"] = RERANK; res["unique"] = UNIQUE
     res["e2e_hit_rate"] = round(sum(hits.values()) / max(1, len(hits)), 2)
     res["e2e_misses"] = [q for q, h in hits.items() if not h]
     # DB-only (vectors pre-embedded), default GUCs vs iterative scan — probe runs inside the container
@@ -308,7 +359,7 @@ def _run_clients(n_clients: int, seconds: float, make_req, label: str) -> dict:
 def _recall_req(u: str):
     def f(cl, rnd, i):
         q = rnd.choice(QUERIES)
-        return cl.post("/recall", json={"user_id": u, "query": q, "limit": 12}).status_code == 200
+        return cl.post("/recall", json=_recall_body(u, q)).status_code == 200
     return f
 
 
@@ -331,7 +382,7 @@ def _facts_req(u: str, tag: str):
 
 def phase_concurrency(a) -> dict:
     u = _check_user(a.user)
-    res: dict = {"phase": "concurrency", "user": u, "seconds": a.seconds, "runs": []}
+    res: dict = {"phase": "concurrency", "user": u, "seconds": a.seconds, "runs": [], "rerank": RERANK, "unique": UNIQUE}
     print(TABLE_HEADER)
     for n in [int(x) for x in a.clients.split(",")]:
         st = StatsSampler().start()
@@ -347,7 +398,7 @@ def phase_concurrency(a) -> dict:
 def phase_mixed(a) -> dict:
     u = _check_user(a.user)
     st = StatsSampler().start()
-    res: dict = {"phase": "mixed", "user": u, "seconds": a.seconds}
+    res: dict = {"phase": "mixed", "user": u, "seconds": a.seconds, "rerank": RERANK, "unique": UNIQUE}
     outs: dict[str, dict] = {}
     lock = threading.Lock()
 
@@ -496,7 +547,7 @@ def phase_filter(a) -> dict:
 
 def phase_worker(a) -> dict:
     u = _check_user(a.user)
-    res: dict = {"phase": "worker", "user": u, "turns": a.turns, "seconds": a.seconds}
+    res: dict = {"phase": "worker", "user": u, "turns": a.turns, "seconds": a.seconds, "rerank": RERANK, "unique": UNIQUE}
     # control: recall x4 with an idle worker
     st = StatsSampler().start()
     res["recall_idle_worker"] = _run_clients(4, a.seconds, _recall_req(u), "recall x4 idle")
@@ -546,7 +597,203 @@ def phase_wipe_http(a) -> dict:
     return res
 
 
-PHASES = {"tei": phase_tei, "baseline": phase_baseline, "real-seed": phase_real_seed, "recall": phase_recall,
+def _embed_at(base: str, model: str, text: str, timeout: float = 30.0) -> tuple[bool, float]:
+    t = time.perf_counter()
+    try:
+        r = httpx.post(f"{base}/v1/embeddings", json={"input": ["search_query: " + text], "model": model}, timeout=timeout)
+        ok = r.status_code == 200 and len(r.json()["data"][0]["embedding"]) == 768
+    except Exception:  # noqa: BLE001
+        ok = False
+    return ok, (time.perf_counter() - t) * 1000
+
+
+def _floor_sweep(fn, label: str, conc_levels=(4, 8), seq_n: int = 20, per_client: int = 5) -> dict:
+    """Sequential seq_n calls, then conc-way bursts of conc*per_client calls; fn(i) -> (ok, ms)."""
+    seq = [fn(i) for i in range(seq_n)]
+    out = {"sequential": summarize([m for _, m in seq], sum(1 for ok, _ in seq if not ok))}
+    print(fmt_row(f"{label}, 1 client", out["sequential"]))
+    for conc in conc_levels:
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            res = list(ex.map(fn, range(conc * per_client)))
+        out[f"concurrent_{conc}"] = summarize([m for _, m in res], sum(1 for ok, _ in res if not ok), time.perf_counter() - t0)
+        print(fmt_row(f"{label}, {conc} clients", out[f"concurrent_{conc}"]))
+    return out
+
+
+def phase_embed_floor(a) -> dict:
+    """Query-embed latency floor per embedding endpoint (the service tries them in this order)."""
+    res: dict = {"phase": "embed-floor", "endpoints": {}}
+    print(TABLE_HEADER)
+    for name, base, model in _parse_endpoints(a.endpoints or EMBED_ENDPOINTS):
+        nonce = int(time.time())
+        res["endpoints"][name] = {"url": base, "model": model,
+                                  **_floor_sweep(lambda i, b=base, m=model: _embed_at(b, m, f"{QUERIES[i % len(QUERIES)]} {nonce}-{i}"),
+                                                 f"embed [{name}]")}
+    return res
+
+
+def _rerank_docs(n: int = 30) -> list[str]:
+    """n hook-shaped texts (fact hooks ~60-120 chars + a few episode hooks ~240 chars, the service's cap)."""
+    rng = random.Random(5)
+    facts = real_facts("bench-real", 400)
+    docs = [f"{f['subject']} {f['predicate'].replace('_', ' ')}: {f['value']}" for f in rng.sample(facts, n - 6)]
+    for i in range(6):
+        docs.append((f"User: remind me how we {QUERIES[i]} last time on the nas?\n\nAssistant: we decided to measure it first, "
+                     f"keep the NAS as the permanent store, and re-run the bench after deploy; numbers were fine.")[:240])
+    return docs
+
+
+def phase_rerank_floor(a) -> dict:
+    """Cross-encoder latency per reranker endpoint: one /rerank call = 1 query × 30 texts (recall's top_n
+    facts + 6 episode hooks), uncached (fresh query text per call)."""
+    res: dict = {"phase": "rerank-floor", "endpoints": {}, "texts_per_call": 30}
+    docs = _rerank_docs(30)
+    print(TABLE_HEADER)
+
+    def one(base: str, i: int) -> tuple[bool, float]:
+        q = f"{QUERIES[i % len(QUERIES)]} {int(time.time() * 1000)}-{i}"
+        t = time.perf_counter()
+        try:
+            r = httpx.post(f"{base}/rerank", json={"query": q, "texts": docs, "truncate": True, "raw_scores": True}, timeout=30)
+            ok = r.status_code == 200 and len(r.json()) == len(docs)
+        except Exception:  # noqa: BLE001
+            ok = False
+        return ok, (time.perf_counter() - t) * 1000
+
+    for name, base, _ in _parse_endpoints(a.endpoints or RERANK_ENDPOINTS):
+        try:
+            info = httpx.get(f"{base}/info", timeout=5).json()
+            model = info.get("model_id"); mbt = info.get("max_batch_tokens")
+        except Exception:  # noqa: BLE001
+            model, mbt = None, None
+        res["endpoints"][name] = {"url": base, "model": model, "max_batch_tokens": mbt,
+                                  **_floor_sweep(lambda i, b=base: one(b, i), f"rerank 30 texts [{name}]")}
+    return res
+
+
+def phase_embed_gap(a) -> dict:
+    """Async write path: write N turns (capture) + N facts with the default (async) path, then poll the
+    store until every row has an embedding. time-to-embedded = how long a new memory is BM25-only."""
+    u = _check_user(a.user)
+    n = a.n
+    tag = f"gap{int(time.time() * 1000)}"
+    res: dict = {"phase": "embed-gap", "user": u, "n": n}
+    ep_ids, f_ids = [], []
+    lat_c, lat_f, err = [], [], 0
+    with _client() as cl:
+        t_write0 = time.perf_counter()
+        for i in range(n):
+            body = {"user_id": u, "kind": "turn", "session_id": f"{u}-{tag}", "cognify": False,
+                    "user_input": f"{tag} turn {i}: is the embedding of {QUERIES[i % len(QUERIES)]} backfilled yet?",
+                    "agent_response": "The worker fills it on its next tick."}
+            t = time.perf_counter()
+            try:
+                r = cl.post("/capture", json=body); ok = r.status_code == 200
+                if ok and r.json().get("episode_id"):
+                    ep_ids.append(r.json()["episode_id"])
+            except Exception:  # noqa: BLE001
+                ok = False
+            lat_c.append((time.perf_counter() - t) * 1000); err += (not ok)
+        for i in range(n):
+            body = {"user_id": u, "subject": f"bench-gap-{i:03d}", "predicate": "bench_attr_01", "value": f"{tag} {QUERIES[i % len(QUERIES)]} #{i}"}
+            t = time.perf_counter()
+            try:
+                r = cl.post("/facts", json=body); ok = r.status_code == 200
+                fid = (r.json().get("fact") or {}).get("id") if ok else None
+                if fid:
+                    f_ids.append(fid)
+            except Exception:  # noqa: BLE001
+                ok = False
+            lat_f.append((time.perf_counter() - t) * 1000); err += (not ok)
+        t_write1 = time.perf_counter()
+    res["capture"] = summarize(lat_c); res["facts_post"] = summarize(lat_f); res["errors"] = err
+    res["writes_s"] = round(t_write1 - t_write0, 2)
+    # poll (through the container probe: 1 SQL every 2 s) until all embedded or timeout
+    sql = ("SELECT (SELECT count(*) FROM episode WHERE id = ANY(%s::uuid[]) AND embedding IS NOT NULL) AS ep, "
+           "(SELECT count(*) FROM fact WHERE id = ANY(%s::uuid[]) AND embedding IS NOT NULL) AS f")
+    t0 = time.perf_counter(); done_ep = done_f = None; samples = []
+    first_ep = first_f = all_ep = all_f = None
+    deadline = t0 + a.seconds
+    while time.perf_counter() < deadline:
+        row = _probe({"op": "sql", "sql": sql, "args": [ep_ids, f_ids]})["rows"][0]
+        el = round(time.perf_counter() - t_write1, 1)
+        samples.append((el, row["ep"], row["f"]))
+        if row["ep"] and first_ep is None:
+            first_ep = el
+        if row["f"] and first_f is None:
+            first_f = el
+        if row["ep"] >= len(ep_ids) and all_ep is None:
+            all_ep = el
+        if row["f"] >= len(f_ids) and all_f is None:
+            all_f = el
+        if all_ep is not None and all_f is not None:
+            break
+        time.sleep(2)
+    res["embedded_at_write"] = {"episodes": samples[0][1] if samples else None, "facts": samples[0][2] if samples else None}
+    res["first_embedded_s"] = {"episodes": first_ep, "facts": first_f}
+    res["all_embedded_s"] = {"episodes": all_ep, "facts": all_f}
+    res["samples"] = samples[:60]
+    print(TABLE_HEADER); print(fmt_row(f"capture async × {n}", res["capture"])); print(fmt_row(f"POST /facts async × {n}", res["facts_post"]))
+    print(f"embedded at write: {res['embedded_at_write']}  first embedded after: {res['first_embedded_s']} s  all embedded after: {res['all_embedded_s']} s")
+    return res
+
+
+def phase_correct_seq(a) -> dict:
+    """N sequential POST /correct on ONE functional key (API-built chain; each supersede writes the
+    belief-axis versioned copy + the new row), then /history + /as_of on that chain and the row count."""
+    u = _check_user(a.user)
+    subj, pred = "bench-chain-subject", "preferred_chain_color"
+    n = a.n
+    lat, codes, actions = [], {}, {}
+    with _client() as cl:
+        t0 = time.perf_counter()
+        for i in range(n):
+            t = time.perf_counter()
+            r = cl.post("/correct", json={"user_id": u, "subject": subj, "predicate": pred, "value": f"chain-color-{i:03d}"})
+            lat.append((time.perf_counter() - t) * 1000); codes[r.status_code] = codes.get(r.status_code, 0) + 1
+            if r.status_code == 200:
+                act = r.json().get("action"); actions[act] = actions.get(act, 0) + 1
+        el = time.perf_counter() - t0
+        res: dict = {"phase": "correct-seq", "user": u, "n": n, "correct": summarize(lat, n - codes.get(200, 0), el),
+                     "codes": codes, "actions": actions}
+        hl = []
+        for _ in range(20):
+            ok, ms = _timed(lambda: cl.get("/history", params={"user_id": u, "subject": subj, "predicate": pred}).status_code == 200)
+            hl.append(ms)
+        hist = cl.get("/history", params={"user_id": u, "subject": subj, "predicate": pred}).json()
+        res["history"] = summarize(hl); res["history_len"] = len(hist) if isinstance(hist, list) else None
+        res["history_active"] = sum(1 for r in hist if r.get("status") == "active") if isinstance(hist, list) else None
+        # as_of along the (seconds-apart) chain: valid axis + belief axis
+        now = datetime.now(timezone.utc)
+        ats = [(now - timedelta(seconds=s)).isoformat() for s in (0, max(1, el * 0.25), max(1, el * 0.5), max(1, el * 0.75), el + 60)]
+        l1, vals = [], []
+        for at in ats:
+            t = time.perf_counter()
+            r = cl.post("/as_of", json={"user_id": u, "at": at, "subject": subj, "predicate": pred})
+            l1.append((time.perf_counter() - t) * 1000); j = r.json(); vals.append(len(j) if isinstance(j, list) else j)
+        res["as_of"] = summarize(l1); res["as_of_rows_per_query"] = vals
+        l2 = []
+        for at in ats:
+            ok, ms = _timed(lambda: cl.post("/as_of", json={"user_id": u, "at": at, "as_believed_at": at, "subject": subj, "predicate": pred}).status_code == 200)
+            l2.append(ms)
+        res["as_of_believed"] = summarize(l2)
+    try:
+        rows = _probe({"op": "sql", "sql": "SELECT status, (meta ? 'version_of') AS versioned, (meta ? 'belief_closed_by') AS closed, count(*) AS n "
+                       "FROM fact WHERE user_id=%s AND subject=%s AND predicate=%s GROUP BY 1,2,3 ORDER BY 1,2,3",
+                       "args": [u, subj, pred]})["rows"]
+        res["db_rows_by_status"] = rows; res["db_rows_total"] = sum(r["n"] for r in rows)
+    except Exception as e:  # noqa: BLE001
+        res["db_rows_by_status"] = str(e)
+    print(TABLE_HEADER); print(fmt_row(f"POST /correct × {n} sequential (1 key)", res["correct"]))
+    print(fmt_row("GET /history", res["history"])); print(fmt_row("POST /as_of scoped", res["as_of"])); print(fmt_row("POST /as_of scoped + as_believed_at", res["as_of_believed"]))
+    print(f"codes={codes} actions={actions} history_len={res['history_len']} (active {res['history_active']}) "
+          f"db rows total={res.get('db_rows_total')} by status={res['db_rows_by_status']} as_of rows/query={vals}")
+    return res
+
+
+PHASES = {"tei": phase_tei, "embed-floor": phase_embed_floor, "rerank-floor": phase_rerank_floor, "embed-gap": phase_embed_gap,
+          "correct-seq": phase_correct_seq, "baseline": phase_baseline, "real-seed": phase_real_seed, "recall": phase_recall,
           "concurrency": phase_concurrency, "mixed": phase_mixed, "correct": phase_correct, "chain": phase_chain,
           "explain": phase_explain, "filter": phase_filter, "db-concurrency": phase_db_concurrency, "worker": phase_worker, "wipe-http": phase_wipe_http}
 
@@ -565,7 +812,14 @@ def main(argv=None) -> int:
     ap.add_argument("--chain-user", default=None, help="explain: user holding the 50-long chain (default: USER)")
     ap.add_argument("--out", default=os.environ.get("BENCH_OUT"))
     ap.add_argument("--label", default=os.environ.get("BENCH_LABEL", ""), help="free tag stored in the record (e.g. 'pre-load', '150k')")
+    ap.add_argument("--rerank", choices=["default", "on", "off"], default=os.environ.get("BENCH_RERANK", "default"),
+                    help="add rerank:true|false to every /recall body (default: the service setting)")
+    ap.add_argument("--unique", action="store_true", help="nonce per recall query: defeats the service's query-embed / rerank caches")
+    ap.add_argument("--endpoints", default=None, help="embed-floor / rerank-floor: 'name=url|model,...' (default: workstation + NAS)")
     a = ap.parse_args(argv)
+    global RERANK, UNIQUE
+    RERANK = None if a.rerank == "default" else (a.rerank == "on")
+    UNIQUE = bool(a.unique)
     rec = PHASES[a.phase](a)
     rec["label"] = a.label
     _emit(a.out, rec)

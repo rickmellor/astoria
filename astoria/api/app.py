@@ -103,7 +103,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Astoria memory service", version=settings().version, lifespan=_lifespan,
-              description="Layered, trusted, bitemporal memory for Nova's agents — REST + MCP (/mcp/).")
+              description="Layered, trusted, bitemporal memory for AI agents and assistants — REST + MCP (/mcp/).")
 
 
 # ---- JSON-lines request log (pure ASGI so SSE/MCP streams are untouched) -------

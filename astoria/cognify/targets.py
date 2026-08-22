@@ -52,7 +52,7 @@ _STOP = {
     "every", "everything", "something", "anything", "nothing", "there", "here", "when", "where",
     "should", "would", "could", "can", "cant", "can't", "will", "wont", "won't", "they", "them",
     "their", "its", "it's", "than", "then", "more", "also", "too", "very", "some", "one",
-    "user", "rick", "mine", "myself", "keep", "note", "noted", "store", "stored", "save", "saved",
+    "user",  "mine", "myself", "keep", "note", "noted", "store", "stored", "save", "saved",
 }
 
 

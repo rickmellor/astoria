@@ -69,6 +69,37 @@ def render(recs: dict) -> tuple[str, dict]:
         P(row("TEI embed, 8 concurrent clients", r["concurrent_8"]))
         P()
 
+    # --- per-endpoint floors (embedding seats, rerankers) ----------------------
+    for lab, r in by_phase(recs, "embed-floor").items():
+        P(f"### Query-embed floor per embedding endpoint (fresh texts, no cache) [{lab}]"); P(); P(H)
+        for name, e in r["endpoints"].items():
+            P(row(f"embed [{name}] {e['model']} 1 client", e["sequential"]))
+            for k in ("concurrent_4", "concurrent_8"):
+                if k in e:
+                    P(row(f"embed [{name}] {k.split('_')[1]} concurrent clients", e[k]))
+        P()
+    for lab, r in by_phase(recs, "rerank-floor").items():
+        P(f"### Cross-encoder floor per reranker endpoint (1 query × {r['texts_per_call']} hooks per call, fresh query) [{lab}]"); P(); P(H)
+        for name, e in r["endpoints"].items():
+            P(row(f"rerank [{name}] 1 client", e["sequential"]))
+            for k in ("concurrent_4", "concurrent_8"):
+                if k in e:
+                    P(row(f"rerank [{name}] {k.split('_')[1]} concurrent clients", e[k]))
+        P()
+    for lab, r in by_phase(recs, "embed-gap").items():
+        P(f"### Async write path — time until the worker has embedded new rows [{lab}]"); P(); P(H)
+        P(row(f"/capture (async) × {r['n']}", r["capture"])); P(row(f"POST /facts (async) × {r['n']}", r["facts_post"])); P()
+        P(f"- embedded at write time: {r['embedded_at_write']}; first row embedded after {r['first_embedded_s']} s; "
+          f"all {r['n']}+{r['n']} embedded after {r['all_embedded_s']} s (writes took {r['writes_s']} s; errors {r.get('errors', 0)})"); P()
+    for lab, r in by_phase(recs, "correct-seq").items():
+        P(f"### {r['n']} sequential POST /correct on ONE functional key (API-built chain, belief-axis versioning) [{lab}]"); P(); P(H)
+        P(row(f"POST /correct × {r['n']} sequential", r["correct"]))
+        P(row(f"GET /history (chain len {r['history_len']}, active {r['history_active']})", r["history"]))
+        P(row(f"POST /as_of scoped (rows/query {r['as_of_rows_per_query']})", r["as_of"]))
+        P(row("POST /as_of scoped + as_believed_at", r["as_of_believed"])); P()
+        P(f"- HTTP {r['codes']}, actions {r['actions']}; rows in `fact` for the key: **{r.get('db_rows_total')}** "
+          f"({r.get('db_rows_by_status')}) → {r.get('db_rows_total', 0) / max(1, r['n']):.2f} rows per /correct"); P()
+
     # --- baseline vs scale ---------------------------------------------------
     base = by_phase(recs, "baseline"); rec = by_phase(recs, "recall")
     if base or rec:
@@ -77,10 +108,14 @@ def render(recs: dict) -> tuple[str, dict]:
             P(row(f"[{lab}] /recall e2e (30 varied queries)", r["recall_e2e"]))
             P(row(f"[{lab}] /recall DB-only (same 30, pre-embedded, in-container)", r["recall_db_only"]))
             P(row(f"[{lab}] TEI query embed (same 30)", r["tei_query_embed"]))
-            P(row(f"[{lab}] /capture cognify=false (turn)", r["capture"]))
-            P(row(f"[{lab}] POST /facts novel set-fact (TEI embed + insert) {r.get('facts_post_actions', '')}", r["facts_post"]))
+            P(row(f"[{lab}] /capture cognify=false (turn){' — async embed' if 'capture_sync' in r else ''}", r["capture"]))
+            if r.get("capture_sync"):
+                P(row(f"[{lab}] /capture cognify=false (turn) sync=true (inline embed)", r["capture_sync"]))
+            P(row(f"[{lab}] POST /facts novel set-fact{' — async embed' if 'facts_post_sync' in r else ' (TEI embed + insert)'} {r.get('facts_post_actions', '')}", r["facts_post"]))
+            if r.get("facts_post_sync"):
+                P(row(f"[{lab}] POST /facts novel set-fact sync=true (inline embed + insert) {r.get('facts_post_sync_actions', '')}", r["facts_post_sync"]))
         for lab, r in rec.items():
-            P(row(f"[{lab}] /recall e2e (real-embedding user, {r['n']} queries)", r["e2e"]))
+            P(row(f"[{lab}] /recall e2e (real-embedding user, {r['n']} queries{', rerank ' + ('on' if r.get('rerank') else 'off') if r.get('rerank') is not None else ''})", r["e2e"]))
             P(row(f"[{lab}] /recall DB-only iterative_scan=off", r["db_only"]))
             P(row(f"[{lab}] /recall DB-only iterative_scan=relaxed_order", r["db_only_iterative"]))
             P(row(f"[{lab}] TEI query embed", r["tei_query_embed"]))
@@ -125,11 +160,14 @@ def render(recs: dict) -> tuple[str, dict]:
     conc = by_phase(recs, "concurrency")
     errors_total = 0
     for lab, r in conc.items():
-        P(f"### Concurrency sweep — /recall only, {r['seconds']:.0f} s each [{lab}]"); P(); P(H)
+        flags = (f" — rerank {'on' if r.get('rerank') else ('off' if r.get('rerank') is False else 'service default')}"
+                 f"{', fresh queries (caches cold)' if r.get('unique') else ', 30 fixed queries (embed/rerank caches warm)'}") if "rerank" in r else ""
+        P(f"### Concurrency sweep — /recall only, {r['seconds']:.0f} s each [{lab}]{flags}"); P(); P(H)
         for run in r["runs"]:
             P(row(f"recall × {run['clients']} clients", run)); errors_total += run.get("errors", 0)
             if run["clients"] == 8:
                 verdict["recall_e2e_p95_8clients_ms"] = run["p95_ms"]
+                verdict[f"recall_e2e_p95_8clients_ms[{lab}]"] = run["p95_ms"]
         P()
         for run in r["runs"]:
             P(f"- {run['clients']} clients peak: {peak_str(run.get('stats'))}")
@@ -147,7 +185,8 @@ def render(recs: dict) -> tuple[str, dict]:
     # --- mixed ---------------------------------------------------------------
     mixed = by_phase(recs, "mixed")
     for lab, r in mixed.items():
-        P(f"### Mixed load — 8 recall + 4 capture + 2 POST /facts clients, {r['seconds']:.0f} s [{lab}]"); P(); P(H)
+        flags = (f" — rerank {'on' if r.get('rerank') else ('off' if r.get('rerank') is False else 'service default')}") if "rerank" in r else ""
+        P(f"### Mixed load — 8 recall + 4 capture + 2 POST /facts clients, {r['seconds']:.0f} s [{lab}]{flags}"); P(); P(H)
         for k, s in r["runs"].items():
             P(row(k, s)); errors_total += s.get("errors", 0)
             if k.startswith("capture"):
@@ -244,6 +283,18 @@ def render(recs: dict) -> tuple[str, dict]:
         ("no container OOM kill", "oom", lambda v: v == 0, True),
         ("exactly 1 active under 20 concurrent /correct", "correct_exactly_one_active", lambda v: v is True, True),
     ]
+    for lab in conc:
+        key = f"recall_e2e_p95_8clients_ms[{lab}]"
+        if key in verdict:
+            checks.insert(1, (f"  recall p95 < 500 ms e2e, 8 concurrent clients [{lab}]", key, lambda v: v < 500, False))
+    for lab, r in by_phase(recs, "correct-seq").items():
+        key = f"correct_seq_errors[{lab}]"; verdict[key] = r["correct"].get("errors", 0)
+        errors_total += r["correct"].get("errors", 0)
+    for lab, r in by_phase(recs, "embed-gap").items():
+        key = f"embed_gap_all_s[{lab}]"; verdict[key] = max(v for v in (r["all_embedded_s"] or {}).values() if v is not None) if any(v is not None for v in (r["all_embedded_s"] or {}).values()) else None
+        checks.append((f"  (info) async embed: every new row embedded within 60 s [{lab}]", key, lambda v: v <= 60, False))
+        errors_total += r.get("errors", 0)
+    verdict["errors"] = errors_total
     for lab, r in by_phase(recs, "db-concurrency").items():
         for run in r["runs"]:
             if run["clients"] == 8:

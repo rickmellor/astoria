@@ -192,7 +192,7 @@ INSERT INTO predicate(name, cardinality, layer_hint, description) VALUES
   ('primary_workstation','functional','profile','main workstation'),
   ('primary_nas','functional','profile','main NAS'),
   ('default_model','functional','semantic','default LLM in use'),
-  ('default_johnny_profile','functional','semantic','johnny boot profile'),
+  ('default_profile','functional','semantic','default profile / preset in use'),
   ('current_focus','functional','semantic','what the user is currently focused on'),
   ('likes','set','profile','things the user likes'),
   ('dislikes','set','profile','things the user dislikes'),

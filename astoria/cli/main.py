@@ -42,23 +42,23 @@ Astoria service over HTTP (it never touches the database).
 
 [bold]Common workflows[/bold]
   [cyan]astoria recall "what editor do I use"[/cyan]            → context block + ranked items
-  [cyan]astoria remember rick favorite_beer IPA[/cyan]           → assert a fact (supersedes the old value)
+  [cyan]astoria remember alice favorite_beer IPA[/cyan]           → assert a fact (supersedes the old value)
   [cyan]astoria remember --text "Prefers dark mode"[/cyan]       → capture a note; the worker extracts facts
-  [cyan]astoria correct rick favorite_beer Stout[/cyan]          → same as remember, shows what it replaced
+  [cyan]astoria correct alice favorite_beer Stout[/cyan]          → same as remember, shows what it replaced
   [cyan]astoria resolve "forget the beer stuff"[/cyan]            → LLM resolves WHICH facts are meant (preview only)
   [cyan]astoria forget "the thing about Guinness"[/cyan]         → resolve → show targets → confirm → apply
   [cyan]astoria facts -q beer[/cyan] · [cyan]astoria fact 3f2a[/cyan]        → browse, then inspect provenance
-  [cyan]astoria history rick favorite_beer[/cyan]                → supersede chain as a timeline
+  [cyan]astoria history alice favorite_beer[/cyan]                → supersede chain as a timeline
   [cyan]astoria as-of 2026-01-01[/cyan]                          → what was true back then
   [cyan]astoria staging[/cyan] → [cyan]astoria approve ID[/cyan]               → review extracted facts
   [cyan]astoria briefing[/cyan] · [cyan]astoria profile[/cyan]                  → stable prompt prefix / who the user is
-  [cyan]astoria graph johnny[/cyan] · [cyan]astoria edge add A runs_on B[/cyan]   → walk / extend the entity graph
-  [cyan]astoria alias add specul8 specul8-o-matic[/cyan]       → two names, one subject
+  [cyan]astoria graph buildbot[/cyan] · [cyan]astoria edge add A runs_on B[/cyan]   → walk / extend the entity graph
+  [cyan]astoria alias add specul8 workstation-1[/cyan]       → two names, one subject
 
 [bold]Environment[/bold]
-  ASTORIA_URL    service base URL   (default http://192.168.1.134:8933)
+  ASTORIA_URL    service base URL   (default http://localhost:8933)
   ASTORIA_TOKEN  bearer token → client name server-side (sent as Authorization: Bearer)
-  ASTORIA_USER   default user_id    (default rick)
+  ASTORIA_USER   default user_id    (default alice)
 
 Short fact ids (first 8 chars, as printed in tables) are accepted anywhere an ID is expected.
 Dates accept YYYY-MM-DD, ISO-8601, or "now" / "today" / "yesterday" / "3 days ago" / "2 weeks ago".
@@ -392,7 +392,7 @@ def _print_upsert(ctx: typer.Context, res: dict, verb: str) -> None:
 @app.command(rich_help_panel=P_WRITE)
 def remember(
     ctx: typer.Context,
-    subject: Optional[str] = typer.Argument(None, help="Subject ('rick' / 'I' / 'me' → the user)."),
+    subject: Optional[str] = typer.Argument(None, help="Subject ('alice' / 'I' / 'me' → the user)."),
     predicate: Optional[str] = typer.Argument(None, help="snake_case predicate, e.g. favorite_beer."),
     value: Optional[str] = typer.Argument(None, help="Value text."),
     text: Optional[str] = typer.Option(
@@ -419,10 +419,10 @@ def remember(
     supersedes the previous value; a set predicate adds another value.
 
     [dim]Examples:[/dim]
-      [cyan]astoria remember rick favorite_beer IPA[/cyan]
-      [cyan]astoria remember rick uses_tool Neovim --set[/cyan]
-      [cyan]astoria remember rick lives_in Portland --from 2024-06-01[/cyan]
-      [cyan]astoria remember rick employer Acme --from 2019-01-01 --to 2023-12-31 --historical[/cyan]
+      [cyan]astoria remember alice favorite_beer IPA[/cyan]
+      [cyan]astoria remember alice uses_tool Neovim --set[/cyan]
+      [cyan]astoria remember alice lives_in Portland --from 2024-06-01[/cyan]
+      [cyan]astoria remember alice employer Acme --from 2019-01-01 --to 2023-12-31 --historical[/cyan]
       [cyan]astoria remember --text "Rick prefers dark mode and tabs over spaces"[/cyan]
     """
     if text:
@@ -585,7 +585,7 @@ def correct(
     preview → confirm → apply.
 
     [dim]Examples:[/dim]
-      [cyan]astoria correct rick favorite_beer Stout[/cyan]
+      [cyan]astoria correct alice favorite_beer Stout[/cyan]
       [cyan]astoria correct "actually I live in Oakland"[/cyan]
     """
     if _looks_like_free_text(subject, predicate) and value is None:
@@ -616,8 +616,8 @@ def retract(
     the fact(s): preview → confirm → apply.
 
     [dim]Examples:[/dim]
-      [cyan]astoria retract rick favorite_beer[/cyan]         (all values of the key)
-      [cyan]astoria retract rick uses_tool Emacs[/cyan]       (one value)
+      [cyan]astoria retract alice favorite_beer[/cyan]         (all values of the key)
+      [cyan]astoria retract alice uses_tool Emacs[/cyan]       (one value)
       [cyan]astoria retract --id 3f2a9c1e[/cyan]
       [cyan]astoria retract "I don't use Emacs anymore"[/cyan]
     """
@@ -746,7 +746,7 @@ def facts(
     [dim]Examples:[/dim]
       [cyan]astoria facts[/cyan]                                (active facts)
       [cyan]astoria facts -q beer --status any[/cyan]
-      [cyan]astoria facts --subject rick --layer profile[/cyan]
+      [cyan]astoria facts --subject alice --layer profile[/cyan]
       [cyan]astoria facts --predicate uses_tool --status superseded[/cyan]
       [cyan]astoria --json facts --limit 500 | jq '.[].value'[/cyan]
     """
@@ -798,7 +798,7 @@ def history(
 ):
     """The supersede chain for (subject, predicate) as a timeline, oldest → newest.
 
-    [dim]Example:[/dim]  [cyan]astoria history rick favorite_beer[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria history alice favorite_beer[/cyan]
     """
     c = _ctx(ctx).client
     rows = _run(ctx, c.history, subject, predicate)
@@ -827,7 +827,7 @@ def as_of(
 
     [dim]Examples:[/dim]
       [cyan]astoria as-of 2025-01-01[/cyan]
-      [cyan]astoria as-of "1 year ago" --subject rick --predicate lives_in[/cyan]
+      [cyan]astoria as-of "1 year ago" --subject alice --predicate lives_in[/cyan]
       [cyan]astoria as-of 2025-06-01 --believed-at 2025-06-01[/cyan]
     """
     c = _ctx(ctx).client
@@ -1151,14 +1151,14 @@ def _graph_node_arg(node: str) -> str:
 @app.command(rich_help_panel=P_GRAPH)
 def graph(
     ctx: typer.Context,
-    node: str = typer.Argument(..., help="Entity name (e.g. johnny), 'entity:NAME' or 'fact:UUID'."),
+    node: str = typer.Argument(..., help="Entity name (e.g. buildbot), 'entity:NAME' or 'fact:UUID'."),
     depth: int = typer.Option(2, "--depth", "-d", min=0, max=6, help="Hops to walk (undirected)."),
     fanout: Optional[int] = typer.Option(None, "--fanout", help="Max edges followed per node per hop."),
 ):
     """Walk the memory graph around NODE: a tree of reachable entities/facts with the relation of
     each hop (GET /graph). Aliases resolve to their canonical entity.
 
-    [dim]Examples:[/dim]  [cyan]astoria graph johnny[/cyan]  ·  [cyan]astoria graph specul8-o-matic --depth 1[/cyan]
+    [dim]Examples:[/dim]  [cyan]astoria graph buildbot[/cyan]  ·  [cyan]astoria graph workstation-1 --depth 1[/cyan]
     """
     c = _ctx(ctx).client
     g = _run(ctx, c.graph, _graph_node_arg(node), depth=depth, fanout=fanout)
@@ -1184,7 +1184,7 @@ def edges(
 ):
     """List graph edges (GET /edges): src —relation→ dst with weight, confidence, provenance.
 
-    [dim]Examples:[/dim]  [cyan]astoria edges[/cyan]  ·  [cyan]astoria edges --node johnny --depth 1[/cyan]
+    [dim]Examples:[/dim]  [cyan]astoria edges[/cyan]  ·  [cyan]astoria edges --node buildbot --depth 1[/cyan]
     ·  [cyan]astoria edges --relation runs_on[/cyan]
     """
     c = _ctx(ctx).client
@@ -1216,7 +1216,7 @@ def edge_add(
     """Assert an edge SRC —RELATION→ DST (POST /edges). Idempotent: re-adding an active edge bumps it.
     Entity endpoints are auto-registered; aliases resolve to their canonical entity.
 
-    [dim]Example:[/dim]  [cyan]astoria edge add johnny runs_on specul8-o-matic[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria edge add buildbot runs_on workstation-1[/cyan]
     """
     c = _ctx(ctx).client
     res = _run(ctx, c.add_edge, src, relation, dst, weight=weight, confidence=confidence, evidence=evidence,
@@ -1267,7 +1267,7 @@ def alias_add(
     """Declare ALIAS to mean CANONICAL (POST /aliases): every later write/read on ALIAS lands on
     CANONICAL. Chains are flattened; the user_id itself cannot be aliased away.
 
-    [dim]Example:[/dim]  [cyan]astoria alias add specul8 specul8-o-matic[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria alias add specul8 workstation-1[/cyan]
     """
     c = _ctx(ctx).client
     res = _run(ctx, c.add_alias, alias, canonical)
@@ -1287,7 +1287,7 @@ def alias_list(
 ):
     """List subject aliases (GET /aliases).
 
-    [dim]Example:[/dim]  [cyan]astoria alias list[/cyan]  ·  [cyan]astoria alias list -c specul8-o-matic[/cyan]
+    [dim]Example:[/dim]  [cyan]astoria alias list[/cyan]  ·  [cyan]astoria alias list -c workstation-1[/cyan]
     """
     c = _ctx(ctx).client
     rows = _run(ctx, c.list_aliases, canonical=canonical)
@@ -1336,7 +1336,7 @@ def export(
     Pair with [cyan]import[/cyan] to move memory between instances.
 
     [dim]Examples:[/dim]
-      [cyan]astoria export -o rick-$(date +%F).json[/cyan]
+      [cyan]astoria export -o alice-$(date +%F).json[/cyan]
       [cyan]astoria --user bob export --status active --no-episodes > bob-facts.json[/cyan]
     """
     c = _ctx(ctx).client
@@ -1380,8 +1380,8 @@ def import_(
     enough to re-run: identical triples are no-ops server-side.
 
     [dim]Examples:[/dim]
-      [cyan]astoria import rick-2026-08-22.json[/cyan]
-      [cyan]astoria --user rick-test import rick.json --all --episodes --dry-run[/cyan]
+      [cyan]astoria import alice-2026-08-22.json[/cyan]
+      [cyan]astoria --user alice-test import alice.json --all --episodes --dry-run[/cyan]
     """
     c = _ctx(ctx).client
     data = json.loads(file.read_text())

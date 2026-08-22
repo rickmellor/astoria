@@ -22,8 +22,9 @@ ASTORIA_URL     REST base (default http://192.168.1.134:8933)
 TEI_URL         TEI base  (default http://192.168.1.134:8931)
 BENCH_DSN       Postgres DSN for seed.py / wipe (the NAS PG is loopback-only → ssh tunnel, below)
 BENCH_DB_EXEC   command that runs a python script from stdin INSIDE the service env
-                (default: "ssh -o BatchMode=yes root-dxp4800gt docker exec -i astoria python -";
-                 set to "" to run db_probe locally against BENCH_DSN)
+                (default: "ssh -o BatchMode=yes root-dxp4800gt docker exec -i astoria python -" — always,
+                 even when BENCH_DSN is exported; set to "" explicitly to run db_probe locally against
+                 BENCH_DSN, and then never read its numbers as DB-only latency: the tunnel adds 40-100 ms)
 BENCH_SSH       ssh host for docker stats (default root-dxp4800gt; "" disables)
 BENCH_OUT       JSONL file every phase appends to
 BENCH_LABEL     tag stored in each record (e.g. pre-load / 150k) — or pass --label

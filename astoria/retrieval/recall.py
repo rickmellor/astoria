@@ -40,7 +40,14 @@ VEC_TOPN_EPIS, BM25_TOPN_EPIS = 20, 20
 MAX_EPISODES = 3
 RERANK_EPISODES = 2 * MAX_EPISODES   # episode hooks are ~4x the tokens of fact hooks and ≤3 are ever shown
 EPISODE_TRUST = 0.6
-HALF_LIFE_DAYS = {"episodic": 30.0, "semantic": 180.0, "belief": 60.0}
+HALF_LIFE_DAYS = {"episodic": 30.0, "semantic": 180.0, "belief": 60.0}   # refreshed from settings in recall()
+
+
+def _refresh_half_lives() -> None:
+    s = settings()
+    HALF_LIFE_DAYS.update(episodic=float(getattr(s, "episodic_half_life_days", 30.0)),
+                          semantic=float(getattr(s, "recency_half_life_days", 180.0)),
+                          belief=float(getattr(s, "belief_half_life_days", 60.0)))
 CONTEXT_HEADER = "Relevant memory (current facts are authoritative; past conversation may be outdated):"
 
 # projections (never the vectors / tsvectors)
@@ -420,6 +427,7 @@ def recall(c: psycopg.Connection, *, user_id: str, query: str, session_id: str |
            rerank: bool | None = None) -> dict:
     """Hybrid recall → the REST /recall response dict (items, working, profile, context, health, snapshot_id).
     `rerank`: None → settings.rerank_enabled; False bypasses the cross-encoder stage (health.rerank="off")."""
+    _refresh_half_lives()
     now = _now()
     query = (query or "").strip()
     layers = tuple(layers) if layers else DEFAULT_LAYERS

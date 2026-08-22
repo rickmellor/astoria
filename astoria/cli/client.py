@@ -3,9 +3,9 @@
 The CLI never touches the database — everything goes through the service.
 Config comes from the environment:
 
-    ASTORIA_URL    base URL          (default http://192.168.1.134:8933)
+    ASTORIA_URL    base URL          (default http://localhost:8933)
     ASTORIA_TOKEN  bearer token      (optional; maps to a client name server-side)
-    ASTORIA_USER   default user_id   (default rick)
+    ASTORIA_USER   default user_id   (default: the server's ASTORIA_USER_DEFAULT)
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from typing import Any
 
 import httpx
 
-DEFAULT_URL = "http://192.168.1.134:8933"
-DEFAULT_USER = "rick"
+DEFAULT_URL = "http://localhost:8933"
+DEFAULT_USER = ""          # empty → the server applies its ASTORIA_USER_DEFAULT
 CLIENT_NAME = "cli"
 
 # exit codes (non-zero on any failure; distinct so scripts can branch)

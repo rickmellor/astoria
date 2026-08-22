@@ -12,3 +12,4 @@ deploy/nas/data/
 .pytest_cache/
 .ruff_cache/
 *.log
+deploy/nas/deploy.env

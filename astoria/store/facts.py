@@ -28,7 +28,7 @@ from astoria.core.embed import embed_one
 
 log = logging.getLogger("astoria.facts")
 
-USER_ALIASES = {"user", "i", "me", "my", "myself", "the user", "owner", "self", "you", "rick"}
+USER_ALIASES = {"user", "i", "me", "my", "myself", "the user", "owner", "self", "you"}
 FUNCTIONAL_PREFIXES = ("favorite_", "default_", "primary_", "preferred_", "current_")
 FUNCTIONAL_SUFFIXES = ("_is", "_name")
 
@@ -370,7 +370,8 @@ def forget(c: psycopg.Connection, *, user_id: str, fact_id: str, mode: str = "so
         return row
 
 
-def update_fact(c: psycopg.Connection, *, user_id: str, fact_id: str, actor: str | None = None, **fields) -> dict | None:
+def update_fact(c: psycopg.Connection, *, user_id: str, fact_id: str, actor: str | None = None,
+                embed: bool | None = None, **fields) -> dict | None:
     """Direct edit by id (no LLM). Editable: value, confidence, importance, tags, layer, valid_from, valid_to,
     asserted_at, is_belief, ref, status (active|archived|staging), evidence, detail."""
     allowed = {"value", "confidence", "importance", "tags", "layer", "valid_from", "valid_to", "asserted_at",
@@ -392,7 +393,9 @@ def update_fact(c: psycopg.Connection, *, user_id: str, fact_id: str, actor: str
                           (*args, fact_id, user_id)).fetchone()
         if row and fields.get("value"):
             hook = render_hook(row["subject"], row["predicate"], row["value"])
-            cur.execute("UPDATE fact SET hook=%s, embedding=%s WHERE id=%s", (hook, embed_one(hook), fact_id))
+            do_embed = settings().embed_sync if embed is None else embed
+            # async write path: NULL embedding → the worker's backfill fills it within one tick
+            cur.execute("UPDATE fact SET hook=%s, embedding=%s WHERE id=%s", (hook, embed_one(hook) if do_embed else None, fact_id))
             row = cur.execute("SELECT * FROM fact WHERE id=%s", (fact_id,)).fetchone()
         if row:
             _audit(cur, user_id, actor, "update", row["id"], {k: (str(v) if k != "ref" else "ref") for k, v in fields.items()})

@@ -45,7 +45,7 @@ def build_mcp():
     mcp = FastMCP("astoria")
 
     @mcp.tool
-    def recall(query: str, user_id: str = "rick", layers: list[str] | None = None, limit: int = 12,
+    def recall(query: str, user_id: str = "", layers: list[str] | None = None, limit: int = 12,
                max_tokens: int = 1000, as_of: str = "", include_profile: bool = False,
                session_id: str = "", facts_only: bool = False) -> dict:
         """Recall what Astoria remembers that is relevant to `query` — call this BEFORE answering anything
@@ -73,7 +73,7 @@ def build_mcp():
 
     @mcp.tool
     def capture(text: str = "", user_input: str = "", agent_response: str = "", kind: str = "note",
-                user_id: str = "rick", session_id: str = "", source: str = "", importance: float = 0.5,
+                user_id: str = "", session_id: str = "", source: str = "", importance: float = 0.5,
                 tags: list[str] | None = None, cognify: bool = True, priority: str = "normal") -> dict:
         """Capture raw experience into memory (non-lossy, durable, cheap): a conversation turn
         (`kind="turn"`, pass user_input + agent_response and a stable `session_id` per conversation), a
@@ -91,14 +91,14 @@ def build_mcp():
         return _res(do_action("capture", p, _client()))
 
     @mcp.tool
-    def remember(subject: str, predicate: str, value: str, user_id: str = "rick", valid_from: str = "",
+    def remember(subject: str, predicate: str, value: str, user_id: str = "", valid_from: str = "",
                  valid_to: str = "", retract: bool = False, layer: str = "", confidence: float | None = None,
                  tags: list[str] | None = None) -> dict:
         """Store (or, with retract=true, withdraw) one EXPLICIT durable fact as a (subject, predicate, value)
         triple — the high-trust path for things the user states or you are certain of.
 
           subject   — who/what it is about. First person ("I", "me", "my", "user") → the user; write the
-                      user_id (e.g. "rick") for facts about the user; a topic/tool/project name otherwise.
+                      user_id (the configured default user) for facts about the user; a topic/tool/project name otherwise.
           predicate — snake_case relation: favorite_beer, location, uses_tool, owns_hardware, decided,
                       works_on_project, likes, learned_howto... Unknown predicates are auto-registered.
                       favorite_/default_/primary_/preferred_/current_ predicates hold ONE current value
@@ -119,7 +119,7 @@ def build_mcp():
 
     @mcp.tool
     def forget(fact_id: str = "", subject: str = "", predicate: str = "", value: str = "", query: str = "",
-               mode: str = "soft", user_id: str = "rick") -> dict:
+               mode: str = "soft", user_id: str = "") -> dict:
         """Forget facts on the user's request ("forget that...", "delete what you know about X").
         Target by `fact_id` (from recall items), by triple (subject[, predicate[, value]]), or by a
         free-text `query` (top matches). mode="soft" archives (hidden from recall, still auditable);
@@ -135,7 +135,7 @@ def build_mcp():
         return _res(do_action("forget", p, _client()))
 
     @mcp.tool
-    def memory(action: str, user_id: str = "rick", fact_id: str = "", subject: str = "", predicate: str = "",
+    def memory(action: str, user_id: str = "", fact_id: str = "", subject: str = "", predicate: str = "",
                value: str = "", status: str = "", layer: str = "", q: str = "", at: str = "",
                as_believed_at: str = "", limit: int = 50, max_tokens: int = 1200, name: str = "",
                cardinality: str = "", layer_hint: str = "", confidence: float | None = None,

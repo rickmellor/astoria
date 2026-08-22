@@ -198,7 +198,8 @@ def _recall(c, p: dict, client: str) -> dict:
     query = str(p.get("query") or "")
     kw = dict(
         user_id=_uid(p), query=query, session_id=p.get("session_id") or None,
-        max_tokens=_int(p.get("max_tokens"), 1000, 50, 20000), limit=_int(p.get("limit"), 12, 1, 200),
+        max_tokens=_int(p.get("max_tokens"), settings().recall_token_budget, 50, 20000),
+        limit=_int(p.get("limit"), settings().recall_limit, 1, 200),
         facts_only=_bool(p.get("facts_only")), include_profile=_bool(p.get("include_profile")),
         as_of=_ts(p.get("as_of")), as_believed_at=_ts(p.get("as_believed_at")), client=client,
         rerank=(None if p.get("rerank") in (None, "") else _bool(p.get("rerank"))),
@@ -506,7 +507,7 @@ def _queue_stats(c, p: dict, client: str) -> dict:
 def _health() -> dict:
     from astoria.core import embed, llm
     s = settings()
-    out: dict[str, Any] = {"status": "ok", "version": s.version}
+    out: dict[str, Any] = {"status": "ok", "version": s.version, "user_default": s.user_default}
     try:
         out["db"] = db.healthcheck()
         with db.conn() as c:

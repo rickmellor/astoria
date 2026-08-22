@@ -28,7 +28,7 @@ You are given:
   new_fact = the replacement, reusing the TARGET's exact subject and predicate spelling when a
   target exists, else a REGISTRY predicate when one fits, else a generic snake_case predicate.
 - `remember` — a new durable fact with nothing to supersede ("remember that I prefer tabs",
-  "note that johnny runs on port 8000"). Targets = []; new_fact = the fact.
+  "note that buildbot runs on port 8000"). Targets = []; new_fact = the fact.
 - `none` — the instruction is not a durable memory operation (chit-chat, a question, a request to
   recall, something transient), OR it names something no candidate matches and nothing new is
   stated. Targets = [], new_fact = null, explain why.
@@ -80,8 +80,8 @@ You are given:
 }
 ```
 
-Examples (USER_ID `rick`; candidates `a1…` = `rick favorite_beer IPA`, `b2…` = `rick location El
-Cerrito`, `c3…` = `rick uses_tool Emacs`):
+Examples (USER_ID `alice`; candidates `a1…` = `alice favorite_beer IPA`, `b2…` = `alice location El
+Cerrito`, `c3…` = `alice uses_tool Emacs`):
 
 INSTRUCTION: `forget the beer stuff`
 ```json
@@ -92,7 +92,7 @@ INSTRUCTION: `forget the beer stuff`
 INSTRUCTION: `actually I moved to Oakland`
 ```json
 {"intent": "correct", "targets": [{"fact_id": "b2…", "reason": "current location is El Cerrito"}],
- "new_fact": {"subject": "rick", "predicate": "location", "value": "Oakland", "valid_from": null},
+ "new_fact": {"subject": "alice", "predicate": "location", "value": "Oakland", "valid_from": null},
  "confidence": 0.92, "explanation": "Replace location El Cerrito with Oakland."}
 ```
 
