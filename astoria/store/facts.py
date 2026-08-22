@@ -50,6 +50,19 @@ def canon_subject(s: str | None, user_id: str) -> str:
     return t.lower() if len(t) <= 64 else t[:64].lower()
 
 
+def canon_subject_db(c, s: str | None, user_id: str) -> str:
+    """canon_subject + alias registry lookup (graph.resolve_alias) — use whenever a connection is at hand."""
+    t = canon_subject(s, user_id)
+    if t == user_id:
+        return t
+    try:
+        from astoria.store.graph import resolve_alias  # local import: graph imports nothing from facts at module load
+        canon = resolve_alias(c, user_id, t)
+    except Exception:  # noqa: BLE001 — alias table missing (pre-003) or transient: fall back to the literal subject
+        canon = None
+    return canon or t
+
+
 def canon_predicate(p: str | None) -> str:
     t = (p or "fact").strip().lower()
     t = re.sub(r"[^a-z0-9_]+", "_", t).strip("_")
@@ -160,7 +173,7 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
     Returns {"fact": row, "action": inserted|superseded|noop|historical|staging|blocked, "superseded": [ids]}.
     """
     s = settings()
-    subject = canon_subject(subject, user_id)
+    subject = canon_subject_db(c, subject, user_id)
     predicate = canon_predicate(predicate)
     value = re.sub(r"\s+", " ", (value or "").strip())
     if not value:
@@ -326,7 +339,7 @@ def retract(c: psycopg.Connection, *, user_id: str, subject: str | None = None, 
             rows = cur.execute("UPDATE fact SET status='retracted', expired_at=now() WHERE id=%s AND user_id=%s "
                                "AND status IN ('active','staging') RETURNING *", (fact_id, user_id)).fetchall()
         else:
-            subject = canon_subject(subject, user_id)
+            subject = canon_subject_db(c, subject, user_id)
             predicate = canon_predicate(predicate)
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(user_id, subject, predicate),))
             q = ("UPDATE fact SET status='retracted', expired_at=now() WHERE user_id=%s AND subject=%s AND predicate=%s "
@@ -415,7 +428,7 @@ def list_facts(c: psycopg.Connection, *, user_id: str, subject: str | None = Non
                limit: int = 50, offset: int = 0) -> list[dict]:
     where, args = ["user_id=%s"], [user_id]
     if subject:
-        where.append("subject=%s"); args.append(canon_subject(subject, user_id))
+        where.append("subject=%s"); args.append(canon_subject_db(c, subject, user_id))
     if predicate:
         where.append("predicate=%s"); args.append(canon_predicate(predicate))
     if status and status != "any":
@@ -437,7 +450,7 @@ def history(c: psycopg.Connection, *, user_id: str, subject: str, predicate: str
     return c.execute(
         f"SELECT * FROM fact WHERE user_id=%s AND subject=%s AND predicate=%s{extra} "
         "ORDER BY asserted_at DESC, ingested_at DESC",
-        (user_id, canon_subject(subject, user_id), canon_predicate(predicate))).fetchall()
+        (user_id, canon_subject_db(c, subject, user_id), canon_predicate(predicate))).fetchall()
 
 
 def as_of(c: psycopg.Connection, *, user_id: str, at: datetime, as_believed_at: datetime | None = None,
@@ -453,7 +466,7 @@ def as_of(c: psycopg.Connection, *, user_id: str, at: datetime, as_believed_at: 
         # CURRENT belief: only rows still believed (not expired/retracted/archived)
         where += ["status IN ('active','superseded')", "expired_at IS NULL"]
     if subject:
-        where.append("subject=%s"); args.append(canon_subject(subject, user_id))
+        where.append("subject=%s"); args.append(canon_subject_db(c, subject, user_id))
     if predicate:
         where.append("predicate=%s"); args.append(canon_predicate(predicate))
     # newest assertion per key wins when several rows overlap the instant

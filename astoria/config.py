@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     embed_require_substring: str = "nomic-embed"     # served-model assertion
     embed_timeout_s: float = 20.0
     embed_max_chars: int = 6000                       # nomic cap is 2048 tokens; TEI auto-truncates
+    # False → capture / POST /facts write rows with embedding NULL (no TEI call in the request) and the
+    # worker's embed_backfill fills them on its next tick; True (or per-request sync=true) embeds inline.
+    embed_sync: bool = False
+
+    # --- rerank (optional cross-encoder stage over the top-N recall candidates) ---
+    # priority list "url|model,url|model" of TEI rerankers (POST /rerank); NAS astoria-rerank container
+    # (cross-encoder/ms-marco-MiniLM-L-6-v2, 22M params, CPU) is the default. Empty → stage off.
+    rerank_urls: str = "http://192.168.1.134:8935|cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_enabled: bool = True                       # kill switch; per-request `rerank=False` also bypasses
+    rerank_top_n: int = 30                            # candidates (facts+episodes, by score) sent to the reranker
+    rerank_weight: float = 0.6                        # final = (1-w)·norm(score) + w·norm(sigmoid(rerank))
+    rerank_timeout_s: float = 3.0                     # read path: fail fast, degrade to the base ranking
 
     # --- LLM (cognify/curator only — never at read) --------------------------
     llm_url: str = "http://192.168.1.221:4000/v1"    # SAINT (workstation; nightly power-off)
@@ -40,6 +52,7 @@ class Settings(BaseSettings):
     llm_timeout_s: float = 120.0
     llm_fallback_model: str = "claude-sonnet-4-6"    # direct Anthropic when SAINT unreachable
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    profile_llm: bool = True                          # LLM profile narrative (source='llm'); template fallback
 
     # --- retrieval defaults -------------------------------------------------
     recall_limit: int = 12
@@ -69,16 +82,20 @@ class Settings(BaseSettings):
 
     # --- workers -------------------------------------------------------------
     worker_enabled: bool = True
-    cognify_poll_s: float = 5.0
+    cognify_poll_s: float = 30.0                      # worker tick: embed_backfill + cognify drain (CONTRACT: 30 s)
     cognify_batch: int = 4
-    curator_interval_min: int = 60
+    curator_interval_min: int = 60                    # profile re-derive check + working-window archive cadence
+    reflect_interval_h: float = 6.0                   # curator.reflect cadence (LLM)
+    curator_daily_h: float = 24.0                     # dedup / decay / snapshot prune cadence
     backup_enabled: bool = True
     backup_hour_local: int = 3
     backup_keep: int = 14
     backup_dir: str = "/backups"
-    working_window_turns: int = 20
-    working_window_hours: int = 12
-    decay_archive_threshold: float = 0.08
+    working_window_turns: int = 20                    # archive_old_turns: keep at most N active turns per session
+    working_window_hours: int = 72                    # archive_old_turns: turns older than this leave working memory
+    decay_archive_threshold: float = 0.08             # curator.decay: score below → status='archived'
+    decay_min_age_days: int = 90                      # curator.decay: only facts ingested longer ago than this
+    dedup_cosine: float = 0.93                        # curator.dedup_facts: near-duplicate threshold
 
     # --- service -------------------------------------------------------------
     host: str = "0.0.0.0"

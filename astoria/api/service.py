@@ -7,7 +7,9 @@ still being built (capture / recall / worker) are imported lazily INSIDE the act
 the service boots — and everything else works — even when one of them is missing
 (`{"error": "module not ready"}`, 503).
 
-Nothing here calls the LLM; TEI outages degrade (embed_one → None) and never error.
+Nothing here calls the LLM — except the on-demand `resolve` / `resolve_apply` actions (the LLM
+target resolver, cognify/targets.py; the LLM only picks targets, writes stay deterministic). TEI
+outages degrade (embed_one → None) and never error.
 """
 from __future__ import annotations
 
@@ -34,6 +36,10 @@ VALID_ACTIONS = (
     "predicates_list", "predicate_update", "audit", "health", "user_wipe",
     # compat (MemoryOS shapes)
     "retrieve", "memories_add", "user_profile",
+    # graph layer + aliases (store/graph.py, retrieval/graph.py)
+    "graph", "edges_list", "edge_add", "edge_delete", "aliases_list", "alias_add", "alias_delete",
+    # LLM target resolver (cognify/targets.py): the ONE read-path-adjacent LLM call — on demand only
+    "resolve", "resolve_apply",
 )
 LAYERS = ("profile", "semantic", "procedural", "episodic")
 
@@ -210,6 +216,8 @@ def _capture(c, p: dict, client: str, *, kind_default: str = "note") -> dict:
         importance=_float(p.get("importance"), 0.5), tags=_list(p.get("tags")), meta=p.get("meta") or None,
         cognify=_bool(p.get("cognify"), True), priority=str(p.get("priority") or "normal"),
     )
+    if p.get("sync") is not None:   # per-request inline embedding; default follows settings().embed_sync
+        kw["sync"] = _bool(p.get("sync"))
     if p.get("text"):
         kw["text"] = str(p["text"])
     if p.get("user_input") is not None or p.get("agent_response") is not None:
@@ -268,6 +276,8 @@ def _fact_add(c, p: dict, client: str) -> dict:
         historical=_bool(p.get("historical")), importance=_float(p.get("importance"), 0.5),
         is_belief=_bool(p.get("is_belief")), evidence=p.get("evidence") or None, meta=p.get("meta") or None,
         ref=p.get("ref") or None,
+        # async write path: embedding NULL unless embed_sync or the request says sync=true (embed_backfill fills it)
+        embed=bool(settings().embed_sync) or _bool(p.get("sync")),
     )
     if p.get("cardinality") not in (None, "", "functional", "set"):
         return _err("cardinality must be functional|set")
@@ -501,7 +511,7 @@ def _health() -> dict:
     return out
 
 
-_WIPE_TABLES = ("cognify_queue", "snapshot", "fact", "episode", "tombstone", "profile_history", "profile", "audit")
+_WIPE_TABLES = ("cognify_queue", "snapshot", "edge", "alias", "entity", "fact", "episode", "tombstone", "profile_history", "profile", "audit")
 
 
 def _user_wipe(c, p: dict, client: str) -> dict:
@@ -516,6 +526,47 @@ def _user_wipe(c, p: dict, client: str) -> dict:
         cur.execute("INSERT INTO audit(user_id, actor, op, target, detail) VALUES (%s,%s,%s,NULL,%s)",
                     (uid, client, "user_wipe", Jsonb(deleted)))
     return {"deleted": True, "user_id": uid, "counts": deleted}
+
+
+# ---- LLM target resolver --------------------------------------------------
+
+def _resolve(c, p: dict, client: str) -> dict:
+    """Natural-language memory instruction → plan (NOT applied). One LLM call (cognify/targets)."""
+    targets = _mod("astoria.cognify.targets")
+    text = str(p.get("text") or p.get("query") or "").strip()
+    if not text:
+        return _err("text required")
+    plan = targets.resolve(c, user_id=_uid(p), text=text, limit=_int(p.get("limit"), 8, 1, 50))
+    if plan.get("error_kind") == "llm_unavailable":
+        return {**plan, "status_code": 503}
+    return plan
+
+
+def _resolve_apply(c, p: dict, client: str) -> dict:
+    """Apply a plan (from `resolve`) or resolve `text` and apply it when no confirmation is needed
+    (or confirm=true). Returns {applied, plan, changed, superseded, fact, action, reason?}."""
+    targets = _mod("astoria.cognify.targets")
+    uid = _uid(p)
+    plan = p.get("plan")
+    if plan is not None and not isinstance(plan, dict):
+        return _err("plan must be an object (the result of resolve)")
+    if plan is None:
+        text = str(p.get("text") or p.get("query") or "").strip()
+        if not text:
+            return _err("resolve_apply needs plan or text")
+        plan = targets.resolve(c, user_id=uid, text=text, limit=_int(p.get("limit"), 8, 1, 50))
+        if plan.get("error_kind") == "llm_unavailable":
+            return {**plan, "applied": False, "status_code": 503}
+        if plan.get("error"):
+            return {"applied": False, "plan": plan, "reason": plan["error"]}
+    confirm = _bool(p.get("confirm"))
+    intent = str(plan.get("intent") or "none")
+    if intent == "none":
+        return {"applied": False, "plan": plan, "reason": plan.get("error") or "no memory operation"}
+    if plan.get("requires_confirmation", True) and not confirm:
+        return {"applied": False, "plan": plan, "reason": "requires_confirmation"}
+    res = targets.apply(c, user_id=uid, plan=plan, source=str(p.get("source") or client), actor=client)
+    return {**res, "plan": plan}
 
 
 # ---- MemoryOS compat ------------------------------------------------------
@@ -570,7 +621,8 @@ def _compat_memories_add(c, p: dict, client: str) -> dict:
         return _err("user_input and agent_response required")
     r = _capture(c, {"user_id": uid, "kind": "turn", "user_input": p.get("user_input") or "",
                      "agent_response": p.get("agent_response") or "", "source": client,
-                     "session_id": p.get("session_id") or None, "occurred_at": p.get("timestamp") or p.get("occurred_at")},
+                     "session_id": p.get("session_id") or None, "occurred_at": p.get("timestamp") or p.get("occurred_at"),
+                     **({"sync": p["sync"]} if p.get("sync") is not None else {})},
                  client, kind_default="turn")
     if isinstance(r, dict) and r.get("error"):
         return r
@@ -580,6 +632,84 @@ def _compat_memories_add(c, p: dict, client: str) -> dict:
 def _compat_user_profile(c, p: dict) -> dict:
     uid = _uid(p)
     return {"user_id": uid, "user_profile": _narrative_or_none(c, uid)}
+
+
+# ---- graph layer + aliases ---------------------------------------------------
+
+def _graph(c, p: dict) -> dict:
+    rg = _mod("astoria.retrieval.graph")
+    node = p.get("node")
+    if not node:
+        return _err("node required (entity name, 'entity:<name>' or 'fact:<uuid>')")
+    depth = _int(p.get("depth"), settings().graph_max_depth, 0, 6)
+    fanout = _int(p.get("fanout"), settings().graph_max_fanout, 1, 200)
+    return _jsonable(rg.render_graph(c, _uid(p), node, depth=depth, fanout=fanout))
+
+
+def _edges_list(c, p: dict) -> list:
+    g = _mod("astoria.store.graph")
+    rows = g.list_edges(c, user_id=_uid(p), node=p.get("node") or None, relation=p.get("relation") or None,
+                        depth=_int(p.get("depth"), 0, 0, 6), status=p.get("status") or "active",
+                        limit=_int(p.get("limit"), 200, 1, 2000), offset=_int(p.get("offset"), 0, 0, 10**9))
+    return [_jsonable(g.row_public(r)) for r in rows]
+
+
+def _edge_add(c, p: dict, client: str) -> dict:
+    g = _mod("astoria.store.graph")
+    for k in ("src", "relation", "dst"):
+        if not p.get(k):
+            return _err(f"{k} required")
+    try:
+        res = g.add_edge(c, user_id=_uid(p), src=p["src"], relation=p["relation"], dst=p["dst"],
+                         src_kind=p.get("src_kind") or None, dst_kind=p.get("dst_kind") or None,
+                         weight=_float(p.get("weight"), 1.0), valid_from=_ts(p.get("valid_from")),
+                         valid_to=_ts(p.get("valid_to")), source=str(p.get("source") or client),
+                         source_kind=str(p.get("source_kind") or "explicit"), confidence=_float(p.get("confidence"), None),
+                         evidence=p.get("evidence") or None, meta=p.get("meta") or None, actor=client)
+    except LookupError as e:
+        return _err(f"not found: {e}", 404)
+    return {"edge": _jsonable(g.row_public(res["edge"])), "action": res["action"]}
+
+
+def _edge_delete(c, p: dict, client: str) -> dict:
+    g = _mod("astoria.store.graph")
+    eid = p.get("edge_id") or p.get("id")
+    if not eid:
+        return _err("edge_id required")
+    mode = str(p.get("mode") or "retract")
+    if mode not in ("retract", "archive", "hard"):
+        return _err("mode must be retract|archive|hard")
+    row = g.retract_edge(c, user_id=_uid(p), edge_id=str(eid), actor=client, mode=mode)
+    if not row:
+        return _err("edge not found", 404)
+    return {"deleted": mode == "hard", "mode": mode, "edge": _jsonable(g.row_public(row))}
+
+
+def _aliases_list(c, p: dict) -> list:
+    g = _mod("astoria.store.graph")
+    rows = g.list_aliases(c, user_id=_uid(p), canonical=p.get("canonical") or None,
+                          limit=_int(p.get("limit"), 500, 1, 5000), offset=_int(p.get("offset"), 0, 0, 10**9))
+    return [_jsonable(g.row_public(dict(r))) for r in rows]
+
+
+def _alias_add(c, p: dict, client: str) -> dict:
+    g = _mod("astoria.store.graph")
+    if not p.get("alias") or not p.get("canonical"):
+        return _err("alias and canonical required")
+    res = g.add_alias(c, user_id=_uid(p), alias=str(p["alias"]), canonical=str(p["canonical"]),
+                      source=str(p.get("source") or client), source_kind=str(p.get("source_kind") or "explicit"),
+                      actor=client)
+    return {"alias": _jsonable(g.row_public(res["alias"])), "action": res["action"], "repointed": res["repointed"]}
+
+
+def _alias_delete(c, p: dict, client: str) -> dict:
+    g = _mod("astoria.store.graph")
+    if not p.get("alias"):
+        return _err("alias required")
+    row = g.delete_alias(c, user_id=_uid(p), alias=str(p["alias"]), actor=client)
+    if not row:
+        return _err("alias not found", 404)
+    return {"deleted": True, "alias": _jsonable(g.row_public(row))}
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +776,24 @@ def do_action(action: str, p: dict | None, client: str = "anonymous") -> dict | 
                 return _compat_memories_add(c, p, client)
             if a == "user_profile":
                 return _compat_user_profile(c, p)
+            if a == "resolve":
+                return _resolve(c, p, client)
+            if a == "resolve_apply":
+                return _resolve_apply(c, p, client)
+            if a == "graph":
+                return _graph(c, p)
+            if a == "edges_list":
+                return _edges_list(c, p)
+            if a == "edge_add":
+                return _edge_add(c, p, client)
+            if a == "edge_delete":
+                return _edge_delete(c, p, client)
+            if a == "aliases_list":
+                return _aliases_list(c, p)
+            if a == "alias_add":
+                return _alias_add(c, p, client)
+            if a == "alias_delete":
+                return _alias_delete(c, p, client)
     except NotReady as e:
         log.info("action %s: %s", a, e)
         return _err("module not ready", 503)
