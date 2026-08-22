@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     user_default: str = "rick"
     # "name:token,name:token" — clients that may assert trust (human-stated facts).
     client_tokens: str = ""
+    # when true, WRITE actions require a valid bearer token (reads stay open on the LAN); default off
+    require_token: bool = False
 
     # --- embeddings (NAS TEI nomic, 768-d, pinned) --------------------------
     embed_url: str = "http://192.168.1.134:8931"

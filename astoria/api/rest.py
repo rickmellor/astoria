@@ -12,7 +12,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
-from astoria.api.auth import client_from_request
+from astoria.api.auth import client_from_request, require_write_token, WriteNotAuthorized
 from astoria.api.service import do_action
 
 router = APIRouter()
@@ -31,6 +31,10 @@ def _respond(r: Any, ok_status: int = 200) -> Any:
 def _run(request: Request, action: str, params: dict | None = None, **extra) -> Any:
     p = dict(params or {})
     p.update({k: v for k, v in extra.items() if v is not None})
+    try:
+        require_write_token(request.headers, action)
+    except WriteNotAuthorized as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
     return _respond(do_action(action, p, client_from_request(request)))
 
 
@@ -121,6 +125,41 @@ class PredicatePatch(_Body):
     cardinality: str | None = None
     layer_hint: str | None = None
     description: str | None = None
+
+
+class ResolveReq(_Body):
+    user_id: str | None = None
+    text: str = ""
+    limit: int = 8
+
+
+class ResolveApplyReq(_Body):
+    user_id: str | None = None
+    text: str | None = None
+    plan: dict | None = None
+    confirm: bool = False
+    limit: int = 8
+
+
+class EdgeReq(_Body):
+    user_id: str | None = None
+    src: str
+    relation: str
+    dst: str
+    src_kind: str | None = None
+    dst_kind: str | None = None
+    weight: float | None = None
+    confidence: float | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    evidence: str | None = None
+    meta: dict | None = None
+
+
+class AliasReq(_Body):
+    user_id: str | None = None
+    alias: str
+    canonical: str
 
 
 class RetrieveReq(_Body):
@@ -230,6 +269,22 @@ def as_of(req: AsOfReq, request: Request):
     return _run(request, "as_of", req.params())
 
 
+# ---- LLM target resolver ----------------------------------------------------
+
+@router.post("/resolve")
+def resolve(req: ResolveReq, request: Request):
+    """Natural-language instruction ("forget the beer stuff") → plan {intent, targets, new_fact,
+    confidence, explanation, requires_confirmation}. Nothing is applied."""
+    return _run(request, "resolve", req.params())
+
+
+@router.post("/resolve/apply")
+def resolve_apply(req: ResolveApplyReq, request: Request):
+    """Apply a plan from /resolve, or pass `text` (+ `confirm: true` to apply even when the plan asks
+    for confirmation)."""
+    return _run(request, "resolve_apply", req.params())
+
+
 # ---- episodes ---------------------------------------------------------------
 
 @router.get("/episodes")
@@ -268,6 +323,48 @@ def predicate_update(name: str, req: PredicatePatch, request: Request):
 def audit(request: Request, user_id: str | None = None, limit: int = Query(50, ge=1, le=1000),
           offset: int = Query(0, ge=0)):
     return _run(request, "audit", user_id=user_id, limit=limit, offset=offset)
+
+
+# ---- graph layer + aliases --------------------------------------------------
+
+@router.get("/graph")
+def graph(request: Request, node: str, user_id: str | None = None, depth: int | None = Query(None, ge=0, le=6),
+          fanout: int | None = Query(None, ge=1, le=200)):
+    return _run(request, "graph", user_id=user_id, node=node, depth=depth, fanout=fanout)
+
+
+@router.get("/edges")
+def edges_list(request: Request, user_id: str | None = None, node: str | None = None, relation: str | None = None,
+               depth: int = Query(0, ge=0, le=6), status: str | None = "active",
+               limit: int = Query(200, ge=1, le=2000), offset: int = Query(0, ge=0)):
+    return _run(request, "edges_list", user_id=user_id, node=node, relation=relation, depth=depth, status=status,
+                limit=limit, offset=offset)
+
+
+@router.post("/edges")
+def edge_add(req: EdgeReq, request: Request):
+    return _run(request, "edge_add", req.params())
+
+
+@router.delete("/edges/{edge_id}")
+def edge_delete(edge_id: str, request: Request, user_id: str | None = None, mode: str = "retract"):
+    return _run(request, "edge_delete", edge_id=edge_id, user_id=user_id, mode=mode)
+
+
+@router.get("/aliases")
+def aliases_list(request: Request, user_id: str | None = None, canonical: str | None = None,
+                 limit: int = Query(500, ge=1, le=5000), offset: int = Query(0, ge=0)):
+    return _run(request, "aliases_list", user_id=user_id, canonical=canonical, limit=limit, offset=offset)
+
+
+@router.post("/aliases")
+def alias_add(req: AliasReq, request: Request):
+    return _run(request, "alias_add", req.params())
+
+
+@router.delete("/aliases/{alias}")
+def alias_delete(alias: str, request: Request, user_id: str | None = None):
+    return _run(request, "alias_delete", alias=alias, user_id=user_id)
 
 
 # ---- dispatcher + admin -----------------------------------------------------

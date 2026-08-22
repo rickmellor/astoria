@@ -28,7 +28,7 @@ from astoria.store import db, facts
 
 log = logging.getLogger("astoria.service")
 
-VALID_ACTIONS = (
+VALID_ACTIONS = ("queue_stats", 
     "recall", "capture", "briefing", "profile",
     "facts_list", "fact_get", "fact_add", "fact_update", "fact_delete",
     "correct", "retract", "forget", "approve", "history", "as_of",
@@ -489,6 +489,19 @@ def _queue_counts(c) -> dict:
             "dead": by.get("dead", 0), "by_state": by}
 
 
+def _queue_stats(c, p: dict, client: str) -> dict:
+    rows = c.execute("SELECT state, count(*) AS n, min(created_at) AS oldest FROM cognify_queue GROUP BY state").fetchall()
+    by = {r["state"]: int(r["n"]) for r in rows}
+    oldest = {r["state"]: (r["oldest"].isoformat() if r["oldest"] else None) for r in rows}
+    dead = c.execute("SELECT id, user_id, episode_id, attempts, last_error, next_attempt_at FROM cognify_queue "
+                     "WHERE state='dead' ORDER BY created_at DESC LIMIT 20").fetchall()
+    pend = c.execute("SELECT count(*) AS n FROM fact WHERE embedding IS NULL AND status IN ('active','staging')").fetchone()
+    pende = c.execute("SELECT count(*) AS n FROM episode WHERE embedding IS NULL AND status='active'").fetchone()
+    return {"by_state": by, "oldest": oldest, "pending": by.get("pending", 0) + by.get("failed", 0) + by.get("running", 0),
+            "dead": by.get("dead", 0), "dead_jobs": [{k: (str(v) if k in ("id", "episode_id") else (v.isoformat() if hasattr(v, "isoformat") else v)) for k, v in d.items()} for d in dead],
+            "embed_backlog": {"facts": pend["n"], "episodes": pende["n"]}}
+
+
 def _health() -> dict:
     from astoria.core import embed, llm
     s = settings()
@@ -728,6 +741,8 @@ def do_action(action: str, p: dict | None, client: str = "anonymous") -> dict | 
         return _health()
     try:
         with db.conn() as c:
+            if a == "queue_stats":
+                return _queue_stats(c, p, client)
             if a == "recall":
                 return _recall(c, p, client)
             if a == "capture":
