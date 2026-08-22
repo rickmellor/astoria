@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     recall_limit: int = 12
     recall_token_budget: int = 1200
     recall_min_score: float = 0.15
-    recall_min_cosine: float = 0.48                   # nomic: unrelated text sits ~0.40-0.47; BM25 covers keyword hits
+    recall_min_cosine: float = 0.45                   # nomic: short personal queries vs long hooks sit ~0.46-0.50; BM25 + query synonyms carry the rest
     vector_candidates: int = 60
     fts_candidates: int = 40
     graph_max_depth: int = 2

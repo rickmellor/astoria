@@ -69,11 +69,41 @@ def _iso(v: Any) -> Any:
     return v.isoformat() if hasattr(v, "isoformat") else v
 
 
+# Light query expansion for the BM25 leg: everyday words → the predicate/value vocabulary facts use.
+# nomic cosine is weak for short personal queries vs long spec-laden hooks ("tell me about my family"
+# scores the spouse fact 0.47 but a signal generator 0.50), so lexical recall must carry these.
+_QUERY_SYNONYMS = {
+    "family": ["spouse", "wife", "husband", "son", "daughter", "kids", "children", "parents", "mother",
+               "father", "dog", "pet", "married", "anniversary"],
+    "wife": ["spouse", "married"], "husband": ["spouse", "married"], "spouse": ["wife", "husband", "married"],
+    "kids": ["son", "daughter", "children", "family"], "children": ["son", "daughter", "kids", "family"],
+    "dog": ["pet"], "dogs": ["pet"], "pets": ["pet", "dog"], "pet": ["dog"],
+    "car": ["vehicle", "owns", "ferrari", "drive"], "cars": ["vehicle", "owns", "ferrari", "drive"],
+    "vehicle": ["car", "owns"], "drive": ["car", "vehicle"],
+    "tools": ["equipment", "uses", "owns"], "tool": ["equipment", "uses"], "equipment": ["tools", "owns"],
+    "gear": ["equipment", "hardware", "owns"], "hardware": ["equipment", "owns"],
+    "job": ["role", "employer", "career", "work"], "work": ["role", "employer", "career", "job", "project"],
+    "career": ["role", "employer", "history"], "employer": ["role", "career", "work"],
+    "live": ["location", "home"], "home": ["location", "live", "house"], "where": ["location"],
+    "hobby": ["hobbies", "interested", "likes"], "hobbies": ["hobby", "interested", "likes"],
+    "like": ["likes", "favorite", "prefer"], "favorite": ["likes", "favourite", "prefer"],
+    "plane": ["aircraft", "aviation"], "planes": ["aircraft", "aviation"], "aircraft": ["plane", "aviation"],
+    "sim": ["simulation", "dcs"], "simulator": ["simulation", "dcs"],
+    "computer": ["workstation", "hardware", "pc"], "machine": ["workstation", "hardware"],
+    "birthday": ["born"], "born": ["birthday"],
+}
+
+
 def _or_tsquery(query: str) -> str | None:
-    """'what beer do I like' → 'what | beer | do | i | like' (to_tsquery stems + drops stopwords).
-    OR semantics: natural-language questions rarely AND-match a 4-word fact hook."""
-    words = [w for w in re.findall(r"\w+", query or "") if len(w) <= 64]
-    return " | ".join(dict.fromkeys(w.lower() for w in words)) or None
+    """'what beer do I like' → 'what | beer | do | i | like | likes | favorite | prefer' (to_tsquery stems +
+    drops stopwords). OR semantics: natural-language questions rarely AND-match a 4-word fact hook;
+    synonyms bridge everyday words to predicate vocabulary."""
+    words = [w.lower() for w in re.findall(r"\w+", query or "") if len(w) <= 64]
+    expanded: list[str] = []
+    for w in words:
+        expanded.append(w)
+        expanded.extend(_QUERY_SYNONYMS.get(w, ()))
+    return " | ".join(dict.fromkeys(expanded)) or None
 
 
 def _recency(age_days: float, half_life: float | None) -> float:
