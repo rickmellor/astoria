@@ -109,8 +109,12 @@ def _fact_row(rng, uid, subj, pred, card, value, status, asserted, valid_to=None
             asserted + timedelta(days=rng.randint(0, 30)), rng.randint(0, 5), rng.randint(0, 2), [], None, None, None, "{}")
 
 
+GROUP_END = object()   # sentinel: a supersede chain ended here — safe to flush a COPY batch
+
+
 def gen_facts(uid: str, n: int, chain_len_special: int | None = None):
-    """Yield n fact rows for uid (as tuples matching FACT_COLS)."""
+    """Yield n fact rows for uid (as tuples matching FACT_COLS), with GROUP_END markers after every
+    complete supersede chain (superseded_by is a DEFERRED FK: a chain must land in one txn)."""
     rng = _rng(uid + "|facts")
     entities = [f"bench-ent-{k:03d}" for k in range(200)]
     func_preds = SEED_FUNC + BENCH_FUNC
@@ -135,6 +139,7 @@ def gen_facts(uid: str, n: int, chain_len_special: int | None = None):
             row[0] = ids[i]
             yield tuple(row)
             emitted += 1
+        yield GROUP_END
 
     while emitted < n:
         functional = rng.random() < 0.35
@@ -161,6 +166,7 @@ def gen_facts(uid: str, n: int, chain_len_special: int | None = None):
                     row[0] = ids[i]
                     yield tuple(row)
                     emitted += 1
+                yield GROUP_END
                 continue
             status = "retracted" if rng.random() < 0.02 else "active"
             at = _ts(rng)
@@ -247,9 +253,16 @@ def copy_rows(c, table: str, cols: str, rows, batch: int = 2000) -> tuple[int, f
         n += len(buf)
         buf.clear()
 
+    pending_group = False   # inside a supersede chain → don't flush until its GROUP_END
     for r in rows:
-        buf.append(r)
-        if len(buf) >= batch:
+        if r is GROUP_END:
+            pending_group = False
+        else:
+            buf.append(r)
+            # a row with superseded_by set starts/continues a chain (FACT_COLS index 16)
+            if table == "fact" and r[16] is not None:
+                pending_group = True
+        if len(buf) >= batch and not pending_group:
             flush()
             el = time.perf_counter() - t0
             print(f"    {table}: {n} rows, {n / el:.0f} rows/s", end="\r", flush=True)
@@ -266,10 +279,15 @@ def sizes(c) -> dict:
         out["tables"][t] = {"total": c.execute("SELECT pg_size_pretty(pg_total_relation_size(%s))", (t,)).fetchone()[0],
                             "heap": c.execute("SELECT pg_size_pretty(pg_relation_size(%s))", (t,)).fetchone()[0],
                             "toast": c.execute("SELECT pg_size_pretty(coalesce(pg_total_relation_size(reltoastrelid),0)) FROM pg_class WHERE relname=%s", (t,)).fetchone()[0]}
+    out["bytes"] = {t: c.execute("SELECT pg_total_relation_size(%s)", (t,)).fetchone()[0] for t in ("fact", "episode")}
+    out["bytes"]["fact_heap"] = c.execute("SELECT pg_relation_size('fact')").fetchone()[0]
+    out["bytes"]["episode_heap"] = c.execute("SELECT pg_relation_size('episode')").fetchone()[0]
     for r in c.execute("SELECT indexrelname, pg_size_pretty(pg_relation_size(indexrelid)), pg_relation_size(indexrelid) "
                        "FROM pg_stat_user_indexes WHERE relname IN ('fact','episode') ORDER BY 3 DESC").fetchall():
         out["indexes"][r[0]] = r[1]
+        out["bytes"][r[0]] = r[2]
     out["db_total"] = c.execute("SELECT pg_size_pretty(pg_database_size(current_database()))").fetchone()[0]
+    out["bytes"]["db_total"] = c.execute("SELECT pg_database_size(current_database())").fetchone()[0]
     out["bench_rows"] = {"fact": c.execute("SELECT count(*) FROM fact WHERE user_id LIKE 'bench-%'").fetchone()[0],
                          "episode": c.execute("SELECT count(*) FROM episode WHERE user_id LIKE 'bench-%'").fetchone()[0]}
     return out
@@ -309,7 +327,8 @@ def wipe(c) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dsn", default=BENCH_DSN)
-    ap.add_argument("--users", type=int, default=20)
+    ap.add_argument("--users", type=int, default=0, help="number of bench-uNN users to LOAD (0 = no load; "
+                    "use with --sizes/--vacuum/--wipe for maintenance only)")
     ap.add_argument("--first-user", type=int, default=0, help="start at bench-uNN (resume)")
     ap.add_argument("--facts", type=int, default=5000)
     ap.add_argument("--episodes", type=int, default=2500)
@@ -318,7 +337,15 @@ def main(argv=None) -> int:
     ap.add_argument("--sizes", action="store_true")
     ap.add_argument("--vacuum", action="store_true")
     ap.add_argument("--wipe", action="store_true")
+    ap.add_argument("--out", default=os.environ.get("BENCH_OUT"), help="append JSON records (load/sizes/wipe) to this file")
     a = ap.parse_args(argv)
+
+    def emit(rec: dict) -> None:
+        import json
+        rec["at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if a.out:
+            with open(a.out, "a") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
     if not a.dsn:
         print("BENCH_DSN (or --dsn) required", file=sys.stderr)
         return 2
@@ -328,20 +355,25 @@ def main(argv=None) -> int:
     if a.wipe:
         r = wipe(c)
         print("wipe:", r)
-        c.autocommit = True
+        c.rollback(); c.autocommit = True
         c.execute("VACUUM ANALYZE fact"); c.execute("VACUUM ANALYZE episode")
-        print_sizes(sizes(c))
+        sz = sizes(c); print_sizes(sz)
+        emit({"phase": "wipe", **r, "sizes": sz})
         return 0
-    if a.sizes and not a.users:
-        print_sizes(sizes(c)); return 0
-    if a.vacuum and not a.users:
-        c.autocommit = True
-        t0 = time.perf_counter(); c.execute("VACUUM ANALYZE fact"); c.execute("VACUUM ANALYZE episode")
-        print(f"VACUUM ANALYZE fact, episode: {time.perf_counter() - t0:.1f}s"); return 0
+    if not a.users:
+        if a.vacuum:
+            c.rollback(); c.autocommit = True
+            t0 = time.perf_counter(); c.execute("VACUUM ANALYZE fact"); c.execute("VACUUM ANALYZE episode")
+            print(f"VACUUM ANALYZE fact, episode: {time.perf_counter() - t0:.1f}s")
+        if a.sizes:
+            sz = sizes(c); print_sizes(sz); emit({"phase": "sizes", "sizes": sz})
+        if not (a.vacuum or a.sizes):
+            ap.print_usage()
+        return 0
 
     ensure_predicates(c)
     if a.index_mode == "rebuild":
-        c.autocommit = True
+        c.rollback(); c.autocommit = True
         c.execute("DROP INDEX IF EXISTS fact_vec"); c.execute("DROP INDEX IF EXISTS episode_vec")
         c.autocommit = False
         print("dropped fact_vec / episode_vec (rebuild mode)")
@@ -354,8 +386,11 @@ def main(argv=None) -> int:
         n, s = copy_rows(c, "fact", FACT_COLS, gen_facts(uid, a.facts, 50 if i == 0 else None), a.batch); tot_f += n; tf += s
         n, s = copy_rows(c, "episode", EPI_COLS, gen_episodes(uid, a.episodes), a.batch); tot_e += n; te += s
     print(f"TOTAL facts {tot_f} in {tf:.0f}s ({tot_f / max(tf, 1e-9):.0f}/s)  episodes {tot_e} in {te:.0f}s ({tot_e / max(te, 1e-9):.0f}/s)")
+    rec = {"phase": "load", "users": a.users, "first_user": a.first_user, "facts": tot_f, "facts_s": round(tf, 1),
+           "facts_rps": round(tot_f / max(tf, 1e-9)), "episodes": tot_e, "episodes_s": round(te, 1),
+           "episodes_rps": round(tot_e / max(te, 1e-9)), "index_mode": a.index_mode}
     if a.index_mode == "rebuild":
-        c.autocommit = True
+        c.rollback(); c.autocommit = True
         for name, tbl in (("fact_vec", "fact"), ("episode_vec", "episode")):
             t0 = time.perf_counter()
             c.execute(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {tbl} USING hnsw(embedding vector_cosine_ops)")
@@ -363,11 +398,13 @@ def main(argv=None) -> int:
                   f"(maintenance_work_mem={c.execute('SHOW maintenance_work_mem').fetchone()[0]})")
         c.autocommit = False
     if a.vacuum:
-        c.autocommit = True
+        c.rollback(); c.autocommit = True
         t0 = time.perf_counter(); c.execute("VACUUM ANALYZE fact"); c.execute("VACUUM ANALYZE episode")
-        print(f"VACUUM ANALYZE: {time.perf_counter() - t0:.1f}s")
+        rec["vacuum_s"] = round(time.perf_counter() - t0, 1)
+        print(f"VACUUM ANALYZE: {rec['vacuum_s']}s")
     if a.sizes:
-        print_sizes(sizes(c))
+        rec["sizes"] = sizes(c); print_sizes(rec["sizes"])
+    emit(rec)
     return 0
 
 

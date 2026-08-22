@@ -1,6 +1,6 @@
 """Recall — the read path (CONTRACT "Recall algorithm"). No LLM, a handful of SQL round-trips.
 
-    candidates  = top-40 cosine (HNSW, ef_search=64, min cosine 0.45) ⊕ top-40 BM25 (ts_rank_cd)
+    candidates  = top-40 cosine (HNSW, ef_search=64, iterative_scan=relaxed_order, min cosine 0.45) ⊕ top-40 BM25 (ts_rank_cd)
                   over facts (layers ∩ {profile,semantic,procedural}) and, unless facts_only,
                   top-20 ⊕ top-20 over episodes (summary/note/import/turn, not this session's turns)
     rrf         = Σ 1/(60+rank) over the lists an entity appears in
@@ -118,9 +118,22 @@ def _rrf(*ranked: Iterable[dict]) -> dict[Any, tuple[float, dict]]:
 # ---------------------------------------------------------------------------
 # candidate generation
 
+HNSW_EF_SEARCH = 64
+# pgvector >= 0.8 iterative scan: keep walking the graph until LIMIT rows survive the WHERE filter.
+# Without it the user_id/status/layer post-filter is applied to only ef_search candidates, and a user
+# holding a small share of the (multi-user) index gets 0-5 of the 40 vector candidates back — measured
+# at 150k rows: 4 % share → mean 1.9/40 with scan=off, 40/40 with relaxed_order (docs/PERFORMANCE.md).
+HNSW_ITERATIVE_SCAN = "relaxed_order"
+
+
+def _hnsw_gucs(c: psycopg.Connection) -> None:
+    c.execute(f"SET LOCAL hnsw.ef_search = {int(HNSW_EF_SEARCH)}")
+    c.execute(f"SET LOCAL hnsw.iterative_scan = {HNSW_ITERATIVE_SCAN}")
+
+
 def _fact_vec(c: psycopg.Connection, user_id: str, qvec: list[float], layers: list[str],
               min_cos: float, topn: int) -> list[dict]:
-    c.execute("SET LOCAL hnsw.ef_search = 64")
+    _hnsw_gucs(c)
     rows = c.execute(
         f"SELECT {FACT_COLS}, 1 - (embedding <=> %s::vector) AS cosine FROM fact "
         "WHERE user_id=%s AND status='active' AND (valid_to IS NULL OR valid_to > now()) "
@@ -154,7 +167,7 @@ def _episode_filter(session_id: str | None, as_of: datetime | None) -> tuple[str
 def _episode_vec(c: psycopg.Connection, user_id: str, qvec: list[float], min_cos: float, topn: int,
                  session_id: str | None, as_of: datetime | None) -> list[dict]:
     where, args = _episode_filter(session_id, as_of)
-    c.execute("SET LOCAL hnsw.ef_search = 64")
+    _hnsw_gucs(c)
     rows = c.execute(
         f"SELECT {EPISODE_COLS}, 1 - (embedding <=> %s::vector) AS cosine FROM episode "
         f"WHERE {where} AND embedding IS NOT NULL ORDER BY embedding <=> %s::vector LIMIT %s",
