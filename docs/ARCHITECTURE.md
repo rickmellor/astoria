@@ -354,3 +354,13 @@ Full route/tool reference with examples: [API.md](API.md).
   `DELETE /users/{id}` wipes one).
 - No telemetry, no external calls except TEI (NAS), SAINT (LAN) and — only for the cognify fallback —
   `api.anthropic.com`.
+
+### Addendum 2026-08-22 — trust guard on functional keys
+A machine-sourced value (`source_kind` extracted / imported / curator) does **not** silently supersede a
+human-stated active value (`explicit` / `detector`) on a functional key. It supersedes only when the
+extractor explicitly declared `contradicts` against that row (it saw the candidate and judged a real
+contradiction — e.g. *"actually my favorite beer is IPA"*). An incidental same-key assertion (e.g.
+*"grew up near Skiatook"* extracted as `location`) lands in **staging** with `meta.conflict_with` and an
+audit row `conflict_staged`; `astoria staging` / `astoria approve <id>` resolve it. Motivation: the
+Claude/Gemini memory-export ingest on 2026-08-22, where a third-party summary briefly overrode an explicit
+location fact.

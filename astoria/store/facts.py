@@ -212,12 +212,16 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
         status = status_override or "active"
         if status == "active" and source_kind in ("extracted", "imported", "curator") and conf < s.confidence_staging_threshold:
             status = "staging"
-        # trust guard: a machine-extracted/imported/curated value must NEVER silently override a
-        # human-stated (explicit/detector) active value on a FUNCTIONAL key — it lands in staging
-        # as a flagged conflict for review (approve_staging promotes it explicitly).
+        # trust guard: a machine-extracted/imported/curated value must not SILENTLY override a
+        # human-stated (explicit/detector) active value on a FUNCTIONAL key. It may supersede only
+        # when the extractor explicitly declared `contradicts` against that row (it saw the candidate
+        # and judged a real contradiction — "actually my favorite beer is IPA"); an incidental same-key
+        # assertion ("grew up near Skiatook" → location) lands in staging as a flagged conflict.
+        declared = {str(x) for x in (contradicts or ())}
         if (status == "active" and active is not None and card == "functional"
                 and source_kind in ("extracted", "imported", "curator")
-                and active.get("source_kind") in ("explicit", "detector")):
+                and active.get("source_kind") in ("explicit", "detector")
+                and str(active["id"]) not in declared):
             status = "staging"
             meta["conflict_with"] = str(active["id"])
             _audit(cur, user_id, actor, "conflict_staged", None,
