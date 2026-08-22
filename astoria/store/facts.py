@@ -118,6 +118,32 @@ def _lift_tombstone(cur, user_id: str, subject: str, predicate: str, vnorm: str)
                 (user_id, subject, predicate, vnorm))
 
 
+
+def _close_versioned(cur, old: dict, new_id, vf: datetime) -> uuid.UUID:
+    """Bitemporal close of an active row `old` superseded by `new_id` (valid from `vf`).
+
+    1. Insert a closed COPY of `old` (same identity/valid_from/asserted_at/embedding, valid_to=max(valid_from,vf),
+       ingested_at=now, status='superseded', superseded_by=new_id, meta.version_of=old.id) — the CURRENT belief.
+    2. Close the ORIGINAL on the belief axis only (expired_at=now, status='superseded', superseded_by=new_id,
+       meta.belief_closed_by=<copy id>) — its valid_to stays as it was believed, so `as_believed_at` before
+       the correction still returns it. Returns the copy's id (what the new fact's `supersedes` points at).
+    """
+    copy_id = uuid.uuid4()
+    meta = dict(old.get("meta") or {})
+    meta["version_of"] = str(old["id"])
+    cur.execute(
+        "INSERT INTO fact(id,user_id,subject,predicate,cardinality,value,hook,detail,embedding,layer,valid_from,valid_to,"
+        "asserted_at,ingested_at,expired_at,status,supersedes,superseded_by,confidence,source,source_kind,source_trust,"
+        "is_belief,importance,last_seen,access_count,corroborations,tags,origin_episode,evidence,ref,meta) "
+        "SELECT %s,user_id,subject,predicate,cardinality,value,hook,detail,embedding,layer,valid_from,"
+        "GREATEST(valid_from,%s),asserted_at,now(),NULL,'superseded',supersedes,%s,confidence,source,source_kind,"
+        "source_trust,is_belief,importance,last_seen,access_count,corroborations,tags,origin_episode,evidence,ref,%s "
+        "FROM fact WHERE id=%s", (copy_id, vf, new_id, Jsonb(meta), old["id"]))
+    cur.execute(
+        "UPDATE fact SET status='superseded', expired_at=now(), superseded_by=%s, "
+        "meta=meta || %s WHERE id=%s", (new_id, Jsonb({"belief_closed_by": str(copy_id)}), old["id"]))
+    return copy_id
+
 # ---------------------------------------------------------------------------
 # write path
 
@@ -219,6 +245,7 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
         # assertion ("grew up near Skiatook" → location) lands in staging as a flagged conflict.
         declared = {str(x) for x in (contradicts or ())}
         if (status == "active" and active is not None and card == "functional"
+                and aa >= active["asserted_at"]                      # older statements take the history path below
                 and source_kind in ("extracted", "imported", "curator")
                 and active.get("source_kind") in ("explicit", "detector")
                 and str(active["id"]) not in declared):
@@ -238,7 +265,7 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
                 "is_belief,importance,tags,origin_episode,evidence,ref,meta) VALUES "
                 "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *",
                 (new_id, user_id, subject, predicate, card, value, hook, vec, lay, vf, vt, aa,
-                 (now_utc() if st in ("superseded",) else None), st, supersedes, sup_by, conf, source, source_kind,
+                 None, st, supersedes, sup_by, conf, source, source_kind,   # historical rows are CURRENT belief (expired_at NULL)
                  trust, is_belief, importance, list(tags), origin_episode, evidence, Jsonb(ref) if ref else None,
                  Jsonb(meta)))
             return cur.fetchone()
@@ -257,25 +284,28 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
             return {"fact": row, "action": "historical", "superseded": []}
 
         superseded: list[str] = []
+        supersedes_id = None
         if status == "active":
-            # close the old active row(s) FIRST (the partial unique index forbids two actives), then insert
+            # close the old active row(s) FIRST (the partial unique index forbids two actives), then insert.
+            # Closing is BITEMPORAL: the original row keeps its valid window as we believed it (belief
+            # axis closed: expired_at=now) and a closed COPY carries the corrected valid_to as the current
+            # belief — so as_of(at, as_believed_at=B) still answers what we believed at B.
             if active and card == "functional":
-                cur.execute(
-                    "UPDATE fact SET status='superseded', valid_to=GREATEST(valid_from, %s), expired_at=now(), "
-                    "superseded_by=%s WHERE id=%s", (vf, new_id, active["id"]))
+                ver = _close_versioned(cur, active, new_id, vf)
+                supersedes_id = ver
                 superseded.append(str(active["id"]))
             # explicit contradictions named by the resolver (any cardinality), same user only
             for cid in contradicts or ():
                 try:
                     r2 = cur.execute(
-                        "UPDATE fact SET status='superseded', valid_to=GREATEST(valid_from, %s), expired_at=now(), "
-                        "superseded_by=%s WHERE id=%s AND user_id=%s AND status='active' AND id<>%s RETURNING id",
-                        (vf, new_id, cid, user_id, new_id)).fetchone()
+                        "SELECT * FROM fact WHERE id=%s AND user_id=%s AND status='active' AND id<>%s",
+                        (cid, user_id, new_id)).fetchone()
                     if r2:
+                        _close_versioned(cur, r2, new_id, vf)
                         superseded.append(str(r2["id"]))
                 except Exception:  # bad uuid etc. — ignore
                     pass
-        row = _insert(status, vt=valid_to, supersedes=(active["id"] if (active and status == "active" and card == "functional") else None))
+        row = _insert(status, vt=valid_to, supersedes=supersedes_id)
         action = "superseded" if superseded else ("staging" if status == "staging" else "inserted")
         _audit(cur, user_id, actor, action, row["id"],
                {"subject": subject, "predicate": predicate, "value": value, "superseded": superseded})
@@ -399,22 +429,29 @@ def list_facts(c: psycopg.Connection, *, user_id: str, subject: str | None = Non
     return c.execute(sql, (*args, limit, offset)).fetchall()
 
 
-def history(c: psycopg.Connection, *, user_id: str, subject: str, predicate: str) -> list[dict]:
-    """Full chain for a key, newest assertion first (active, superseded, retracted, archived, staging)."""
+def history(c: psycopg.Connection, *, user_id: str, subject: str, predicate: str,
+            include_expired: bool = False) -> list[dict]:
+    """Full chain for a key, newest assertion first (active, superseded, retracted, archived, staging).
+    Belief-closed originals (rows superseded by a versioned copy) are hidden unless include_expired."""
+    extra = "" if include_expired else " AND NOT (meta ? 'belief_closed_by')"
     return c.execute(
-        "SELECT * FROM fact WHERE user_id=%s AND subject=%s AND predicate=%s ORDER BY asserted_at DESC, ingested_at DESC",
+        f"SELECT * FROM fact WHERE user_id=%s AND subject=%s AND predicate=%s{extra} "
+        "ORDER BY asserted_at DESC, ingested_at DESC",
         (user_id, canon_subject(subject, user_id), canon_predicate(predicate))).fetchall()
 
 
 def as_of(c: psycopg.Connection, *, user_id: str, at: datetime, as_believed_at: datetime | None = None,
           subject: str | None = None, predicate: str | None = None, limit: int = 50) -> list[dict]:
     """Point-in-time on the VALID axis (status-aware); optional BELIEF axis via as_believed_at."""
-    where = ["user_id=%s", "valid_from <= %s", "(valid_to IS NULL OR valid_to > %s)",
-             "status IN ('active','superseded')"]
+    where = ["user_id=%s", "valid_from <= %s", "(valid_to IS NULL OR valid_to > %s)"]
     args: list = [user_id, at, at]
     if as_believed_at is not None:
-        where += ["ingested_at <= %s", "(expired_at IS NULL OR expired_at > %s)"]
+        # BELIEF axis: rows we had ingested by B and had not expired by B — whatever their status is NOW
+        where += ["status NOT IN ('staging','deleted')", "ingested_at <= %s", "(expired_at IS NULL OR expired_at > %s)"]
         args += [as_believed_at, as_believed_at]
+    else:
+        # CURRENT belief: only rows still believed (not expired/retracted/archived)
+        where += ["status IN ('active','superseded')", "expired_at IS NULL"]
     if subject:
         where.append("subject=%s"); args.append(canon_subject(subject, user_id))
     if predicate:

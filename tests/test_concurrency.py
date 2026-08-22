@@ -57,7 +57,7 @@ def test_concurrent_distinct_values_one_active(dsn, db, store_user_id):
     errors = [r for r in results if r["action"] == "error"]
     assert not errors, f"upsert errors under contention: {errors[:3]}"
 
-    rows = _rows(db, uid, uid, "favorite_beer")
+    rows = [r for r in _rows(db, uid, uid, "favorite_beer") if not (r["meta"] or {}).get("version_of")]  # logical rows (belief-axis copies excluded)
     assert len(rows) == WORKERS, f"expected {WORKERS} rows, got {len(rows)}"
     active = [r for r in rows if r["status"] == "active"]
     assert len(active) == 1, f"expected exactly one active, got {[r['value'] for r in active]}"
@@ -91,7 +91,7 @@ def test_concurrent_identical_upserts_one_row(dsn, db, store_user_id):
     assert actions.count("inserted") == 1, actions
     assert actions.count("noop") == WORKERS - 1, actions
 
-    rows = _rows(db, uid, uid, "favorite_editor")
+    rows = [r for r in _rows(db, uid, uid, "favorite_editor") if not (r["meta"] or {}).get("version_of")]  # logical rows (belief-axis copies excluded)
     assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
     assert rows[0]["status"] == "active"
     assert rows[0]["access_count"] == WORKERS - 1, rows[0]["access_count"]
@@ -107,7 +107,7 @@ def test_concurrent_set_valued_distinct_all_active(dsn, db, store_user_id):
     errors = [r for r in results if r["action"] == "error"]
     assert not errors, f"upsert errors under contention: {errors[:3]}"
     assert all(r["action"] == "inserted" for r in results), sorted(r["action"] for r in results)
-    rows = _rows(db, uid, uid, "likes")
+    rows = [r for r in _rows(db, uid, uid, "likes") if not (r["meta"] or {}).get("version_of")]  # logical rows (belief-axis copies excluded)
     assert len(rows) == n
     assert all(r["status"] == "active" for r in rows)
     assert len({r["value_norm"] for r in rows}) == n
@@ -121,7 +121,7 @@ def test_concurrent_mixed_set_dupes(dsn, db, store_user_id):
     results = _run(dsn, jobs)
     errors = [r for r in results if r["action"] == "error"]
     assert not errors, errors[:3]
-    rows = _rows(db, uid, uid, "uses_tool")
+    rows = [r for r in _rows(db, uid, uid, "uses_tool") if not (r["meta"] or {}).get("version_of")]  # logical rows (belief-axis copies excluded)
     assert len(rows) == 5
     assert all(r["status"] == "active" for r in rows)
     assert sum(1 for r in results if r["action"] == "noop") == WORKERS - 5
@@ -155,6 +155,6 @@ def test_concurrent_correct_then_retract_race(dsn, db, store_user_id):
         results = list(ex.map(worker, range(WORKERS)))
     errors = [r for r in results if r["action"] == "error"]
     assert not errors, errors[:3]
-    rows = _rows(db, uid, uid, "current_focus")
+    rows = [r for r in _rows(db, uid, uid, "current_focus") if not (r["meta"] or {}).get("version_of")]  # logical rows (belief-axis copies excluded)
     assert sum(1 for r in rows if r["status"] == "active") <= 1
     assert len(rows) == 1 + sum(1 for i in range(WORKERS) if i % 4 != 3)

@@ -69,10 +69,14 @@ def test_t1_correction_propagates(client, user_id, tei_ok):
     old = _get_fact(client, user_id, old_id)
     assert old["status"] == "superseded"
     assert old["superseded_by"] == new_id
-    assert old["valid_to"] is not None
+    # bitemporal close: the ORIGINAL keeps its believed valid window (valid_to stays NULL) and is closed
+    # on the belief axis; a versioned COPY (meta.version_of=old) carries the corrected valid_to.
     assert old["expired_at"] is not None
+    assert (old.get("meta") or {}).get("belief_closed_by")
     new = _get_fact(client, user_id, new_id)
-    assert new["supersedes"] == old_id
+    sup = _get_fact(client, user_id, new["supersedes"])
+    assert sup["id"] == old_id or (sup.get("meta") or {}).get("version_of") == old_id
+    assert sup["valid_to"] is not None
     assert new["status"] == "active" and new["valid_to"] is None
 
     hist = client.get("/history", params={"user_id": user_id, "subject": user_id, "predicate": "favorite_beer"})
@@ -198,8 +202,11 @@ def test_t3_temporal_as_of(client, user_id):
     believed = _post(client, "/as_of", user_id=user_id, at="2026-07-15T12:00:00Z",
                      as_believed_at=(before - timedelta(days=1)).isoformat(), predicate="default_johnny_profile")
     assert believed == [], believed
-    # NOTE (contract gap, see report): a `historical` insert stamps expired_at at ingest, so
-    # as_believed_at=now on the valid instant 2026-07-15 returns [] rather than coder. Not asserted.
+    # belief axis, current: a `historical` insert is a currently-believed past truth
+    now_b = client.post("/as_of", json={"user_id": user_id, "at": "2026-07-15T00:00:00Z",
+                                          "as_believed_at": datetime.now(UTC).isoformat(),
+                                          "predicate": "default_johnny_profile"}).json()
+    assert [r["value"] for r in now_b] == ["coder"], now_b
 
 
 def test_t3b_backdated_correction_wins(client, user_id):
