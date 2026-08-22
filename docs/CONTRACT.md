@@ -65,7 +65,7 @@ episodes.add_episode(c, *, user_id, kind, text=None, user_input=None, agent_resp
 episodes.recent_turns(c, *, user_id, session_id, n=4) -> [rows]
 episodes.get_episode / list_episodes / archive_episode / delete_episode / row_public
 # astoria/core/capture.py  (TO BUILD)
-capture.gate(text) -> reason|None          # drop: ^/\w+, len<8, {ok,done,y,n,yes,no,thanks,continue}
+capture.gate(text) -> reason|None          # drop: ^/\w+ (except /remember /correct /forget, which the detector handles first), len<8, acks {ok,done,y,n,yes,no,thanks,continue}
 capture.detect(text, user_id) -> {"op": "correct"|"retract"|"remember", "subject","predicate","value"}|None  # regex v1
 capture.capture(c, *, user_id, kind, text|user_input+agent_response, source, session_id, occurred_at,
                 importance, tags, meta, cognify=True, priority="normal"|"high")
@@ -76,10 +76,11 @@ recall.recall(c, *, user_id, query, session_id=None, layers=("profile","semantic
               as_believed_at=None, client=None) -> RecallResult (dict, see REST below)
 recall.briefing(c, *, user_id, max_tokens=1200) -> {"narrative","facts":[...],"context": str}
 # astoria/cognify/resolver.py + worker.py  (TO BUILD)
-resolver.extract(job_text, occurred_at, candidates, registry) -> parsed JSON (pydantic-validated) | None
-resolver.apply(c, *, user_id, episode_ids, parsed, source, session_id) -> {"facts": [...], "summary_episode": id|None}
+resolver.gather_context(c, *, user_id, job_text, limit=30) -> (candidates, registry)
+resolver.extract(job_text, occurred_at, user_id, candidates, registry) -> Extraction | None   # raises LLMUnavailable
+resolver.apply(c, *, user_id, episode_ids, parsed, source, session_id, occurred_at) -> {"facts": [...], "retracted": [...], "summary_episode": id|None}
 worker.run_forever(stop_event)   # asyncio task started in app lifespan; tick 30s; coalesce by session
-worker.drain_once(limit=4) -> {"processed": n, "failed": n}
+worker.drain_once(limit=4) -> {"processed", "failed", "dead", "skipped"}
 # astoria/curator/*.py (TO BUILD): embed_backfill(c), rederive_profile(c, user_id), prune_snapshots(c), archive_old_turns(c)
 ```
 
@@ -133,8 +134,8 @@ Empty store → `context: ""`.
 
 ## Recall algorithm (defaults)
 
-candidates: per layer top-40 cosine (HNSW, `hnsw.ef_search=64`, min cosine **0.45**) ⊕ top-40 BM25
-(`ts_rank_cd`) → RRF k=60 → `score = rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)`;
+candidates: per layer top-40 cosine (HNSW, `hnsw.ef_search=64`, min cosine **0.48** — nomic-calibrated) ⊕ top-40 BM25
+(`ts_rank_cd`, OR-semantics `to_tsquery` over query words) → RRF k=60 → `score = rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)`;
 `recency = exp(-ln2·age_days/half_life)` with half-life episodic 30d · semantic 180d · beliefs 60d ·
 profile/procedural ∞; `trust = confidence × source_trust`. Collapse by `(subject,predicate)` (functional
 → 1 row; set → all). Budget `max_tokens` (≈chars/4), facts before episodes, episodes ≤ 3. `stale_hint`
