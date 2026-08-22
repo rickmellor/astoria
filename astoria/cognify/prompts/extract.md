@@ -164,3 +164,6 @@ Edge/alias example — TEXT: `buildbot (the inference manager, now renamed nova)
 "evidence": "now renamed nova"}]`.
 
 Reply with the JSON object only.
+
+
+> `contradicts` may ONLY list candidate ids that have the SAME subject and predicate as the new fact (the old value of the same key). Never use it to point at facts about other subjects or other predicates — those are different facts, not contradictions.

@@ -310,9 +310,16 @@ def upsert_fact(c: psycopg.Connection, *, user_id: str, subject: str, predicate:
             # explicit contradictions named by the resolver (any cardinality), same user only
             for cid in contradicts or ():
                 try:
+                    # a declared contradiction may only close a value of the SAME key — an extractor once
+                    # named an unrelated fact id and closed `rick primary_workstation` with an owns_hardware row
                     r2 = cur.execute(
-                        "SELECT * FROM fact WHERE id=%s AND user_id=%s AND status='active' AND id<>%s",
-                        (cid, user_id, new_id)).fetchone()
+                        "SELECT * FROM fact WHERE id=%s AND user_id=%s AND status='active' AND id<>%s "
+                        "AND subject=%s AND predicate=%s",
+                        (cid, user_id, new_id, subject, predicate)).fetchone()
+                    if r2 is None:
+                        _audit(cur, user_id, actor, "contradicts_ignored", None,
+                               {"subject": subject, "predicate": predicate, "value": value, "target": str(cid),
+                                "reason": "target is not an active fact of the same key"})
                     if r2:
                         _close_versioned(cur, r2, new_id, vf)
                         superseded.append(str(r2["id"]))
