@@ -262,11 +262,16 @@ def retract(c: psycopg.Connection, *, user_id: str, subject: str | None = None, 
     (explicit/detector retracts block re-extraction; extracted retracts don't block explicit re-asserts)."""
     with c.cursor() as cur:
         if fact_id:
+            key = cur.execute("SELECT subject, predicate FROM fact WHERE id=%s AND user_id=%s", (fact_id, user_id)).fetchone()
+            if not key:
+                return []
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(user_id, key["subject"], key["predicate"]),))
             rows = cur.execute("UPDATE fact SET status='retracted', expired_at=now() WHERE id=%s AND user_id=%s "
                                "AND status IN ('active','staging') RETURNING *", (fact_id, user_id)).fetchall()
         else:
             subject = canon_subject(subject, user_id)
             predicate = canon_predicate(predicate)
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(user_id, subject, predicate),))
             q = ("UPDATE fact SET status='retracted', expired_at=now() WHERE user_id=%s AND subject=%s AND predicate=%s "
                  "AND status IN ('active','staging')")
             args: list = [user_id, subject, predicate]

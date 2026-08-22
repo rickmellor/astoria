@@ -1,0 +1,9 @@
+{
+  "_comment": "Merge into ~/.claude.json → mcpServers (Claude Code). Replaces the old `memoryos` entry (http://192.168.1.134:8930/mcp/). Astoria MCP is streamable-HTTP at /mcp/ (trailing slash). Optional: add \"headers\": {\"Authorization\": \"Bearer <token>\"} once ASTORIA_CLIENT_TOKENS is set on the NAS.",
+  "mcpServers": {
+    "astoria": {
+      "type": "http",
+      "url": "http://192.168.1.134:8933/mcp/"
+    }
+  }
+}
