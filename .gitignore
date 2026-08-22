@@ -13,3 +13,4 @@ deploy/nas/data/
 .ruff_cache/
 *.log
 deploy/nas/deploy.env
+deploy/nas/offsite/

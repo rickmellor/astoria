@@ -74,6 +74,7 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       BACKUP_INTERVAL_S: ${BACKUP_INTERVAL_S:-21600}
       BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      OFFSITE_KEEP: ${OFFSITE_KEEP:-60}   # copies kept in /offsite (a share your cloud-sync tool mirrors off-site)
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -83,6 +84,12 @@ services:
           if pg_dump -Fc -h astoria-postgres -U "$${POSTGRES_USER:-astoria}" "$${POSTGRES_DB:-astoria}" > "$$f.tmp"; then
             mv "$$f.tmp" "$$f"; echo "backup ok $$f"
             ls -1t /backups/*.dump 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+            # off-site copy: a world-readable mirror in /offsite (mount a share that a cloud-sync task watches)
+            if [ -d /offsite ]; then
+              cp "$$f" "/offsite/$$(basename "$$f").tmp" && mv "/offsite/$$(basename "$$f").tmp" "/offsite/$$(basename "$$f")" \
+                && chmod 644 "/offsite/$$(basename "$$f")" && echo "offsite copy ok"
+              ls -1t /offsite/*.dump 2>/dev/null | tail -n +$$((OFFSITE_KEEP+1)) | xargs -r rm -f
+            fi
           else
             echo "backup FAILED"; rm -f "$$f.tmp"
           fi
@@ -90,6 +97,7 @@ services:
         done
     volumes:
       - ./backups:/backups
+      - ${ASTORIA_OFFSITE_DIR:-./offsite}:/offsite   # optional: a share mirrored off-site by your cloud-sync tool
     depends_on:
       astoria-postgres:
         condition: service_healthy

@@ -256,3 +256,9 @@ belief axis at the store, T12 compatibility routes, plus health, wipe, briefing/
 forget-by-query and predicate flips. `tests/test_belief_axis.py` pins the versioned supersede (original
 belief-closed, copy carries `valid_to`, `history` hides the original, `as_believed_at` answers the past).
 Every test uses a throwaway `user_id` and wipes it.
+
+### Off-site mirror via the backup sidecar
+Set `ASTORIA_OFFSITE_DIR` (host directory or share mounted into the sidecar at `/offsite`) and the sidecar
+copies every new dump there (mode 644, `OFFSITE_KEEP` copies). Point any cloud-sync tool (rclone, a NAS
+"cloud drives" app, Dropbox/Drive clients) at that directory as a **one-way, outbound** task — never a
+bidirectional sync with delete propagation. Restore works from any copy with `pg_restore` (see above).
