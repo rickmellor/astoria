@@ -18,4 +18,4 @@ EXPOSE 8933
 HEALTHCHECK --interval=60s --timeout=15s --start-period=40s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8933/health', timeout=10)"
 
-CMD ["uvicorn", "astoria.api.app:app", "--host", "0.0.0.0", "--port", "8933", "--workers", "1"]
+CMD ["uvicorn", "astoria.api.app:app", "--host", "0.0.0.0", "--port", "8933", "--workers", "2"]

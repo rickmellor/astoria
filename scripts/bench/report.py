@@ -166,8 +166,10 @@ def render(recs: dict) -> tuple[str, dict]:
         for run in r["runs"]:
             P(row(f"recall × {run['clients']} clients", run)); errors_total += run.get("errors", 0)
             if run["clients"] == 8:
-                verdict["recall_e2e_p95_8clients_ms"] = run["p95_ms"]
                 verdict[f"recall_e2e_p95_8clients_ms[{lab}]"] = run["p95_ms"]
+                # contract row = the service default (rerank on, or an unlabelled sweep), warm caches; other labels listed below it
+                if "recall_e2e_p95_8clients_ms" not in verdict or (r.get("rerank") is not False and not r.get("unique")):
+                    verdict["recall_e2e_p95_8clients_ms"] = run["p95_ms"]
         P()
         for run in r["runs"]:
             P(f"- {run['clients']} clients peak: {peak_str(run.get('stats'))}")
@@ -275,24 +277,28 @@ def render(recs: dict) -> tuple[str, dict]:
     checks = [
         ("recall p95 < 500 ms e2e, 8 concurrent clients, at scale (TEI-inclusive)", "recall_e2e_p95_8clients_ms", lambda v: v < 500, True),
         ("  (info) recall p95 e2e, 1 client, at scale", "recall_e2e_1client_p95_ms", lambda v: v < 500, False),
-        ("DB-only recall p95 < 80 ms at scale (real-embedding user, scan=off as deployed)", "recall_db_only_p95_ms", lambda v: v < 80, True),
-        ("  (info) same with the iterative-scan fix (scan=relaxed_order)", "recall_db_only_iterative_p95_ms", lambda v: v < 80, False),
+        ("DB-only recall p95 < 80 ms at scale (real-embedding user, deployed code: scan=relaxed_order)", "recall_db_only_iterative_p95_ms", lambda v: v < 80, True),
+        ("  (info) same probe with the session GUC scan=off (the deployed recall() still SET LOCALs relaxed_order; only the candidate-count query differs)", "recall_db_only_p95_ms", lambda v: v < 80, False),
         ("capture p95 < 400 ms (1 client, at scale)", "capture_1client_p95_ms", lambda v: v < 400, True),
         ("  (info) capture p95 under mixed load (8 recall + 4 capture + 2 facts clients)", "capture_p95_ms", lambda v: v < 400, False),
         ("zero HTTP errors across all phases", "errors", lambda v: v == 0, True),
         ("no container OOM kill", "oom", lambda v: v == 0, True),
         ("exactly 1 active under 20 concurrent /correct", "correct_exactly_one_active", lambda v: v is True, True),
     ]
-    for lab in conc:
+    for i, lab in enumerate(conc):
         key = f"recall_e2e_p95_8clients_ms[{lab}]"
         if key in verdict:
-            checks.insert(1, (f"  recall p95 < 500 ms e2e, 8 concurrent clients [{lab}]", key, lambda v: v < 500, False))
+            hard = not conc[lab].get("unique") and conc[lab].get("rerank") is False   # the rerank-off sweep is a hard row too (report both)
+            checks.insert(1 + i, (f"  {'' if hard else '(info) '}recall p95 < 500 ms e2e, 8 concurrent clients [{lab}]", key, lambda v: v < 500, hard))
     for lab, r in by_phase(recs, "correct-seq").items():
         key = f"correct_seq_errors[{lab}]"; verdict[key] = r["correct"].get("errors", 0)
         errors_total += r["correct"].get("errors", 0)
     for lab, r in by_phase(recs, "embed-gap").items():
-        key = f"embed_gap_all_s[{lab}]"; verdict[key] = max(v for v in (r["all_embedded_s"] or {}).values() if v is not None) if any(v is not None for v in (r["all_embedded_s"] or {}).values()) else None
-        checks.append((f"  (info) async embed: every new row embedded within 60 s [{lab}]", key, lambda v: v <= 60, False))
+        key = f"embed_gap_all_s[{lab}]"
+        vals = list((r["all_embedded_s"] or {}).values())
+        # None = not embedded before the phase's polling window closed → report the window as a lower bound
+        verdict[key] = max(vals) if vals and all(v is not None for v in vals) else f"> {r['samples'][-1][0] if r.get('samples') else '?'} s ({', '.join(k for k, v in (r['all_embedded_s'] or {}).items() if v is None)} not embedded in the window)"
+        checks.append((f"  (info) async embed: every new row embedded within 60 s [{lab}]", key, lambda v: isinstance(v, (int, float)) and v <= 60, False))
         errors_total += r.get("errors", 0)
     verdict["errors"] = errors_total
     for lab, r in by_phase(recs, "db-concurrency").items():

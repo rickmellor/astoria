@@ -211,6 +211,14 @@ def _endpoint(c: psycopg.Connection, user_id: str, node: Any, kind: str | None) 
     return k, nid
 
 
+def _bust_edge_cache(user_id: str) -> None:
+    try:
+        from astoria.retrieval import recall as _r
+        _r._EDGE_CACHE.pop(user_id, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def add_edge(c: psycopg.Connection, *, user_id: str, src: Any, relation: str, dst: Any,
              src_kind: str | None = None, dst_kind: str | None = None, weight: float = 1.0,
              valid_from: datetime | None = None, valid_to: datetime | None = None,
@@ -266,6 +274,7 @@ def add_edge(c: psycopg.Connection, *, user_id: str, src: Any, relation: str, ds
              origin_episode, (evidence or None) and str(evidence)[:500], Jsonb(meta))).fetchone()
         _audit(cur, user_id, actor, "edge_add", row["id"], {"src": node_ref(sk, sid), "dst": node_ref(dk, did),
                                                              "relation": rel, "source_kind": source_kind})
+    _bust_edge_cache(user_id)
     return {"edge": dict(row), "action": "inserted"}
 
 

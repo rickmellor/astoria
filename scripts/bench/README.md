@@ -10,9 +10,9 @@ Only user_ids with the prefix **`bench-`** are ever written, and `seed.py --wipe
 | file | what |
 |---|---|
 | `common.py` | env, percentile helpers, the 30 varied queries, the realistic 500-triple "real user" generator, TEI embed helper, `docker stats` sampler (ssh), OOM check |
-| `seed.py` | deep loader: direct COPY of N facts + M episodes per `bench-uNN` user with random unit vectors (supersede chains, retracted rows, 50-long chain on `bench-u00`); `--sizes`, `--vacuum`, `--wipe` |
+| `seed.py` | deep loader: direct COPY of N facts + M episodes per `bench-uNN` user with random unit vectors (supersede chains, retracted rows, 50-long chain on `bench-u00`); `--sizes`, `--vacuum`, `--wipe` (all `bench-*` rows incl. `edge`/`entity`/`alias`), `--edges N --edges-user U` (random active edges for the graph-expansion probe) |
 | `db_probe.py` | DB-only probe that runs the service's own `recall()` with pre-embedded vectors; shipped into the `astoria` container (`docker exec -i astoria python -`) so the numbers exclude the ssh tunnel; also EXPLAIN and step breakdowns |
-| `loadgen.py` | measurement phases: `tei`, `baseline`, `real-seed`, `recall`, `concurrency`, `mixed`, `correct`, `chain`, `explain`, `worker`, `wipe-http` |
+| `loadgen.py` | measurement phases: `tei`, `embed-floor`, `rerank-floor`, `baseline`, `real-seed`, `embed-gap`, `recall`, `concurrency`, `db-concurrency`, `filter`, `mixed`, `correct`, `correct-seq`, `chain`, `explain`, `worker`, `wipe-http`; global flags `--rerank on|off` (request flag on every `/recall`) and `--unique` (nonce per query → service caches cold) |
 | `report.py` | JSONL → markdown tables + pass/fail verdict (`--json` for CI) |
 
 ## Environment
@@ -67,15 +67,64 @@ $PY scripts/bench/seed.py --wipe                               # removes every b
 kill %1                                                        # the tunnel
 ```
 
-Thresholds (in `report.py`): recall p95 < 500 ms e2e with 8 concurrent clients at scale (TEI-inclusive);
+## Run 2 (2026-08-22, feature-complete build) — the sequence that produced docs/PERFORMANCE.md §7
+
+```sh
+export BENCH_OUT=scripts/bench/results/2026-08-22-run2.jsonl     # BENCH_DSN as above; BENCH_DB_EXEC stays at its default (in-container)
+$PY scripts/bench/loadgen.py embed-floor  --label pre-load        # workstation seat vs NAS TEI, 1/4/8-way
+$PY scripts/bench/loadgen.py rerank-floor --label pre-load        # workstation vs NAS reranker, 30 hooks/call
+$PY scripts/bench/loadgen.py tei          --label pre-load
+$PY scripts/bench/loadgen.py real-seed bench-real --n 500 --workers 4 --label pre-load   # async now: wait for embed_backfill (~3 ticks)
+$PY scripts/bench/loadgen.py embed-gap bench-real --n 20 --seconds 120 --label pre-load
+$PY scripts/bench/loadgen.py baseline  bench-real --label pre-load                       # capture/facts async + sync:true
+$PY scripts/bench/loadgen.py recall    bench-real --n 50 --rerank on  --label pre-load
+$PY scripts/bench/loadgen.py recall    bench-real --n 50 --rerank off --label "pre-load rerank=off"
+$PY scripts/bench/seed.py --users 20 --facts 5000 --episodes 2500 --vacuum --sizes
+$PY scripts/bench/loadgen.py recall      bench-real --n 50 --rerank on  --label 150k
+$PY scripts/bench/loadgen.py recall      bench-real --n 50 --rerank off --label "150k rerank=off"
+$PY scripts/bench/loadgen.py baseline    bench-real --label 150k
+$PY scripts/bench/loadgen.py concurrency bench-real --clients 1,4,8,16 --seconds 60 --rerank on  --label "150k rerank=on"
+$PY scripts/bench/loadgen.py concurrency bench-real --clients 1,4,8,16 --seconds 60 --rerank off --label "150k rerank=off"
+$PY scripts/bench/loadgen.py concurrency bench-real --clients 1,4,8 --seconds 60 --rerank on  --unique --label "150k rerank=on fresh-queries"
+$PY scripts/bench/loadgen.py concurrency bench-real --clients 1,4,8 --seconds 60 --rerank off --unique --label "150k rerank=off fresh-queries"
+$PY scripts/bench/loadgen.py mixed       bench-real --seconds 60 --rerank on  --label "150k rerank=on"
+$PY scripts/bench/loadgen.py mixed       bench-real --seconds 60 --rerank off --label "150k rerank=off"
+$PY scripts/bench/loadgen.py correct     bench-real --label 150k
+$PY scripts/bench/loadgen.py correct-seq bench-real --n 50 --label 150k                # belief-axis rows per /correct
+$PY scripts/bench/loadgen.py chain       bench-u00  --label 150k
+$PY scripts/bench/loadgen.py explain     bench-real --chain-user bench-u00 --label 150k
+$PY scripts/bench/loadgen.py worker      bench-real --turns 100 --seconds 60 --rerank on --label 150k
+$PY scripts/bench/loadgen.py embed-gap   bench-real --n 20 --seconds 120 --label 150k
+$PY scripts/bench/loadgen.py explain     bench-u05 --chain-user bench-u00 --label 150k-bulk-user
+$PY scripts/bench/loadgen.py filter      bench-u05 --n 20 --label 150k
+$PY scripts/bench/loadgen.py recall      bench-u05 --n 20 --random-vectors --rerank off --label 150k-bulk-user
+$PY scripts/bench/loadgen.py db-concurrency bench-real --clients 1,4,8,16 --seconds 20 --iterative --label "150k real-user scan=relaxed_order"
+$PY scripts/bench/loadgen.py db-concurrency bench-u05  --clients 1,4,8,16 --seconds 20 --iterative --random-vectors --label "150k bulk-user 4% share scan=relaxed_order (worst case)"
+$PY scripts/bench/seed.py --edges 2000 --edges-user bench-real                          # graph-expansion cost with edges
+$PY scripts/bench/loadgen.py recall      bench-real --n 50 --rerank off --label "150k rerank=off +2000 edges"
+$PY scripts/bench/seed.py --sizes
+$PY scripts/bench/report.py $BENCH_OUT > /tmp/bench-tables.md
+$PY scripts/bench/seed.py --wipe
+```
+
+Thresholds (in `report.py`): recall p95 < 500 ms e2e with 8 concurrent clients at scale (TEI-inclusive; reported per concurrency label — the
+rerank-on (service default) and rerank-off warm sweeps are both hard rows, `fresh-queries` sweeps are informational);
 DB-only recall p95 < 80 ms; capture p95 < 400 ms; zero errors; no OOM; exactly one active row under
 20 concurrent `/correct`.
 
-The raw JSONL of the 2026-08-22 run is kept at `scripts/bench/results/2026-08-22.jsonl`; `report.py` on it reproduces every table in
-`docs/PERFORMANCE.md`. `report.py` exits 0 only when every hard threshold passes (the TEI-bound ones fail on the NAS today).
+The raw JSONL of the two 2026-08-22 runs is kept at `scripts/bench/results/2026-08-22.jsonl` (run 1) and
+`scripts/bench/results/2026-08-22-run2.jsonl` (run 2, feature-complete build); `report.py` on either reproduces its tables in
+`docs/PERFORMANCE.md`. `report.py` exits 0 only when every hard threshold passes.
 
 ## Notes / gotchas
 
+* The DB-only probe runs the deployed `recall()` with `rerank=False` (store-only numbers); the deployed code SET LOCALs
+  `hnsw.iterative_scan=relaxed_order` inside each vector query, so the probe's "scan=off" mode now only changes the
+  candidate-count query, not the recall timing.
+* The service caches query embeddings (LRU 1 024) and `(query, hook)` rerank logits (LRU 4 096): the 30 fixed QUERIES are warm after
+  one pass. Use `--unique` for the cold-path number; report both.
+* `real-seed` / `baseline` / `embed-gap` writes are async-embedded: wait for `embed_backfill` (≤200 facts + 200 episodes per 30 s tick)
+  before semantic-quality probes on freshly written rows.
 * **Don't measure DB-only latency through the ssh tunnel.** The 768-d vector parameter (~15 KB of text,
   sent twice per query) trips Nagle/delayed-ACK stalls in the tunnel (+40–100 ms per query). That is
   why `db_probe.py` runs inside the container.

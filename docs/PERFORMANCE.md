@@ -3,7 +3,9 @@
 > **Numbers from the 2026-08 validation run.** Every table in §2 was produced by the harness in
 > `scripts/bench/` (`report.py` over `scripts/bench/results/2026-08-22.jsonl`) against a live deployment on a
 > small NAS-class host; re-run the harness (README there) to refresh them for your hardware. §6 records the
-> reranker evaluation; numbers for the asynchronous write path are pending the next run.
+> reranker evaluation. **§7 is the second run on the feature-complete build** (asynchronous write path, rerank
+> stage on/off under concurrency, workstation embedding seat, graph expansion, belief-axis versioning) with
+> before/after tables against §2 and an updated verdict — read it first; §0–§5 are the run-1 baseline.
 
 ## 0. Verdict (short)
 
@@ -787,12 +789,390 @@ Verdict: a real but modest ranking gain for a few hundred milliseconds on a CPU 
 interactive clients whose queries repeat (the logit cache makes repeats free), turn it off per request
 (`rerank=false`) for latency-critical paths, and move the stage to a GPU endpoint to raise `top_n`.
 
-**Asynchronous write path**: no dedicated phase in the 2026-08 run (it was measured only indirectly: the
-idempotent replay path of `capture` — no embed — costs ~6 ms p50 versus ~230 ms with an inline embed).
-A `capture`/`POST /facts` sweep with `ASTORIA_EMBED_SYNC=false` is pending the next harness run.
+**Asynchronous write path**: measured in run 2 (§7.2 "Write path"): `/capture` 6.4 ms p50 / 8.0 ms p95 and
+`POST /facts` 8.5 / 11.0 ms at 150 k rows with the default async embed (234 / 270 and 263 / 289 ms in run 1),
+122 / 133 and 135 / 171 ms with `sync:true`; the worker embeds new rows within 24–37 s on a quiet store and
+falls behind under write bursts (§7.4 defects B/C).
+
+## 7. 2026-08 run 2 (feature-complete build)
+
+Same harness, same shape of load (20 bench users × 5 000 facts + 2 500 episodes by direct COPY, plus the 500 real-embedding
+facts of `bench-real` written through `POST /facts`), same NAS, run against the feature-complete build: async write-path embedding,
+the cross-encoder rerank stage, the workstation embedding seat, migrations 002–004, graph expansion, `hnsw.iterative_scan=relaxed_order`
+in the deployed code, and belief-axis versioning. Raw records: `scripts/bench/results/2026-08-22-run2.jsonl`
+(`scripts/bench/report.py` on it reproduces every table below). Labels: `pre-load` = 500 real facts, ~0 other rows;
+`150k` = 101 546 facts + 51 488 episodes after the deep load; `rerank=on|off` = the `/recall` request flag;
+`fresh-queries` = a nonce per query (service caches cold); `+2000 edges` = 1 989 seeded graph edges on `bench-real`.
+The run-1 numbers quoted for comparison are from §2.
+
+### 7.0 Verdict (short)
+
+**The read path got ~2.5× faster per call and the write path ~30× faster, and the ceiling moved from the NAS embedder to the service
+process itself.** Single-client `/recall` is **80 ms p50 / 103 ms p95** at 150 k rows with the rerank stage off (run 1: 205 / 225–313 ms)
+and **282 / 517 ms** with it on, cold; `/capture` is **6 ms p50 / 8 ms p95** (run 1: 234 / 270) and `POST /facts` 8.5 / 11 ms (run 1: 263 / 289)
+because the embed now happens in the worker. With the service's query-embed and rerank caches warm, 8 concurrent recall clients see
+**p95 493 ms (rerank off) / 500 ms (rerank on)** — on the line, both sides plateau at **~20 req/s with the single uvicorn worker at
+~110 % CPU** (PG at ~100 %). With every query fresh (caches cold) the same 8 clients see p95 **1 121 ms off / 1 790 ms on**: the
+workstation embedding seat tops out at ~22 embeds/s and the workstation reranker at ~12 calls/s, so 8 uncached recalls queue behind
+them exactly as they queued behind the NAS TEI in run 1 — lower floor (65 ms embed, 116 ms rerank), same shape.
+
+Three things regressed or surfaced and are the work items from this run:
+
+1. **The DB-only recall p95 is now 87–94 ms (threshold 80; run 1: 56–68).** The extra ~20 ms is graph expansion, which runs a seed-subject
+   lookup, a recursive edge walk and up to ten "facts about this subject" queries per recall *even when the user has no edges* (0 edges
+   on the whole store during the phase). With 2 000 edges on the user it costs **174 ms p50 / 243 ms p95** and DB-only recall becomes
+   253 / 329 ms.
+2. **The mixed load (8 recall + 4 capture + 2 facts clients) produced 9 HTTP 500s (2 `DeadlockDetected`, 7 `PoolTimeout` after 30 s) and
+   18–34 s stalls.** Cause: the worker's `embed_backfill` embeds and UPDATEs up to 200 facts + 200 episodes in **one transaction** whose
+   duration under load was ~30 s (ticks landed 60 s apart for a 30 s tick); recall's `access_count/last_seen` touch-UPDATE on freshly
+   written rows waits on those row locks, connections pile up behind the waits (pool max 8, getconn timeout 30 s), and the two
+   UPDATE orders deadlock. Not a store-size effect: it is write-rate × backfill-transaction-length.
+3. **The async-embed "recall gap" is bounded by the backfill rate, not by the 30 s tick.** Quiet store: new rows are embedded after
+   24 s (pre-load) / 37 s (150 k). After the 60 s mixed load had written ~1 400 rows the backlog drained at ~4–7 rows/s, so 20 new
+   episodes were **still un-embedded 121 s later** (BM25-only for that long).
+
+| contract threshold | run 1 @150 k | run 2 @150 k | result |
+|---|---|---|---|
+| recall p95 < 500 ms e2e, **8 concurrent clients** | 1 406 ms (NAS-TEI-bound) | **493 ms rerank off · 500 ms rerank on** (warm caches, ~20 req/s, service CPU-bound) · 1 121 / 1 790 ms with fresh queries | **PASS (off, marginal) / FAIL by 0.2 ms (on)**; FAIL cold |
+| DB-only recall p95 < 80 ms | 67.7 (55.8 with the iterative-scan fix) | **90.2 ms** (87–94 across phases; graph expansion +20 ms) | **FAIL** (regression, fixable) |
+| capture p95 < 400 ms | 270 single / 3 236 mixed | **8.0 ms single · 306–335 ms mixed** | PASS (both) |
+| zero errors | 0 | **9** (mixed load, rerank on: 2 deadlocks + 7 pool timeouts) | **FAIL** (defect 7.4-B) |
+| no OOM | pass | `OOMKilled=false`, 0 restarts (PG peak 824 MiB/1 GiB in the DB-only hammer) | PASS |
+| exactly 1 active under 20 concurrent `/correct` | pass (p95 4 130 ms) | **1 active, history 20, p95 436 ms** | PASS (9.5× faster — embed outside the lock) |
+
+### 7.1 What changed since run 1 (and how each change was measured)
+
+| change | where | measured by |
+|---|---|---|
+| write-path embedding is **asynchronous**: `/capture` and `POST /facts` return before the embed; the worker's `embed_backfill` fills `embedding` on its next tick (30 s, ≤200 facts + 200 episodes per tick) | `settings.embed_sync=False`; per-request `sync:true` opts back in | `baseline` (async vs `sync:true`), `embed-gap` (time until new rows are embedded), `real-seed` |
+| **cross-encoder rerank** over the top-30 fact + 6 episode candidates (TEI MiniLM-L6; workstation endpoint `:8935` first, NAS `:8935` fallback); request flag `rerank:false` bypasses; `(query, hook)` LRU 4 096 | `astoria/core/rerank.py`, `recall._apply_rerank` | `rerank-floor` (per endpoint), every `/recall` phase twice (`--rerank on/off`), `concurrency` both ways, warm and `--unique` |
+| embeddings prefer the **workstation nomic seat via SAINT** (`:4000`) over the NAS TEI; query LRU 1 024 | `astoria/core/embed.py` | `embed-floor` (per endpoint), e2e recall |
+| schema **002** (chain indexes) + **004** (autovacuum 0.02 / fillfactor 90 on `fact`/`episode`) | `astoria/sql/` | wipe time, `pg_stat_user_tables` HOT ratio |
+| **graph expansion** in recall (bounded walk from the top-10 seeds + facts about their subjects; depth 2, fanout 20) | `astoria/retrieval/graph.py`, migration 003 | DB-only step `graph_expand(sql)`; `recall` with 0 and with 2 000 seeded edges |
+| `hnsw.iterative_scan=relaxed_order` in the deployed `recall.py` | `recall._hnsw_gucs` | `filter`, `recall` bulk user, `db-concurrency` |
+| **belief-axis versioning**: each supersede writes a versioned copy of the closed row (+1 row per `/correct`) | `facts._close_versioned` | `correct` (20 concurrent), `correct-seq` (50 sequential on one key), `chain` |
+
+Environment delta vs §1: `astoria` 768 MiB / 1 worker / pool max 8 (unchanged); `astoria-postgres` unchanged (1 GiB, `shared_buffers=256MB`);
+new `astoria-rerank` container on the NAS (1 GiB, MiniLM-L6 CPU) and a second reranker + the nomic seat on the workstation (both
+"nightly-off", the NAS copies are the fallback). The client (workstation) carried a load average of ~5 during the run, which is also
+the host of the preferred embed and rerank endpoints — treat the workstation-endpoint floors as upper bounds. The store was restarted by a
+deploy mid-load (bench-u04 rolled back and re-seeded; the load table below shows the resumed part only: combined **100 012 facts in
+916 s = 109/s, 50 000 episodes in 408 s = 122/s**, identical to run 1's 107 / 121).
+
+### 7.2 Results
+
+#### Per-endpoint floors (fixed per-request costs; fresh texts, no cache)
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | req/s | errors |
+|---|---|---|---|---|---|---|---|
+| embed [workstation seat via SAINT] 1 client | 20 | 64.7 | 96.8 | 413.5 | 492.6 |  | 0 |
+| embed [workstation] 4 concurrent | 20 | 152.1 | 249.3 | 249.8 | 249.9 | 22.41 | 0 |
+| embed [workstation] 8 concurrent | 40 | 363.4 | 498.3 | 499.0 | 499.4 | 22.16 | 0 |
+| embed [NAS TEI] 1 client | 20 | 197.6 | 233.8 | 238.2 | 239.2 |  | 0 |
+| embed [NAS TEI] 4 concurrent | 20 | 670.3 | 802.0 | 802.1 | 802.1 | 5.7 | 0 |
+| embed [NAS TEI] 8 concurrent | 40 | 1360.9 | 1443.3 | 1716.2 | 1716.2 | 5.64 | 0 |
+| rerank 30 hooks [workstation] 1 client | 20 | 116.4 | 132.8 | 133.4 | 133.5 |  | 0 |
+| rerank 30 hooks [workstation] 4 concurrent | 20 | 330.2 | 369.6 | 427.9 | 442.5 | 11.31 | 0 |
+| rerank 30 hooks [workstation] 8 concurrent | 40 | 633.6 | 717.6 | 755.7 | 779.9 | 12.08 | 0 |
+| rerank 30 hooks [NAS] 1 client | 20 | 323.5 | 428.2 | 630.2 | 680.7 |  | 0 |
+| rerank 30 hooks [NAS] 4 concurrent | 20 | 1417.5 | 1522.1 | 1552.5 | 1560.1 | 2.79 | 0 |
+| rerank 30 hooks [NAS] 8 concurrent | 40 | 2704.6 | 2965.1 | 2970.9 | 2972.3 | 2.89 | 0 |
+
+The workstation seat is ~3× faster per embed and ~3.5× higher throughput than the NAS TEI (22 vs 5.6 embeds/s); the workstation reranker
+is ~3× faster than the NAS one (116 vs 324 ms per 30-hook call, 12 vs 2.9 calls/s). **If the workstation is off, a cold recall with rerank
+costs ≈ 200 ms embed + 320 ms rerank + ~70 ms store ≈ 0.6 s single-client, and the NAS reranker alone caps recall at < 3 req/s.**
+
+#### Write path — before / after (single client; run 1 in parentheses)
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | errors |
+|---|---|---|---|---|---|---|
+| [150k] `/capture` cognify=false, **async embed (default)** | 30 | **6.4** (234.0) | **8.0** (269.7) | 8.5 | 8.7 | 0 |
+| [150k] `/capture` `sync:true` (inline embed, workstation seat) | 30 | 122.4 | 133.0 | 395.1 | 501.7 | 0 |
+| [150k] `POST /facts` novel set-fact, **async embed (default)** | 30 | **8.5** (262.9) | **11.0** (288.9) | 20.3 | 24.0 | 0 |
+| [150k] `POST /facts` `sync:true` | 30 | 135.4 | 170.6 | 429.6 | 527.5 | 0 |
+| [pre-load] `POST /facts` real ×500, 4 workers (the real-embedding seed) | 500 | 13.6 | 44.4 | 78.1 | 118.5 | 0 (49.6 req/s) |
+| [150k] `POST /correct` × 50 sequential, one key (belief-axis versioned) | 50 | 13.3 | 54.0 | 56.9 | 57.6 | 0 (52.9 req/s) |
+| [150k] `POST /correct` × 20 **concurrent**, one key | 20 | **217.2** (2 153) | **435.7** (4 130) | 453.0 | 457.3 | 0; 1 active, history 20 |
+
+Async-embed gap (time from write until the worker has embedded the rows; `embed-gap`, 20 turns + 20 facts):
+
+| store state | embedded at write | first row embedded after | all 40 embedded after |
+|---|---|---|---|
+| pre-load, worker idle | 0 | 24.1 s | 24.1 s |
+| 150 k, **backlog of ~900 episodes from the mixed load still draining** | 0 | facts 37.3 s; episodes > 121 s | facts 37.3 s; **episodes not embedded within the 121 s window** |
+
+Backfill ticks observed in the service log during the drain: `facts=200 episodes=200` at 22:49:04, 22:50:11, 22:51:12, 22:52:00, 22:53:01,
+22:53:57 — i.e. ~60 s apart for a 30 s tick = each tick's transaction ran ~30 s; ~1 400 rows written in the 60 s mixed load took ~5.5 min to
+embed (≈ 4.3 rows/s sustained). The 500-row real seed (idle store) took 100 s = 3 ticks.
+
+#### `/recall` single client — before / after, rerank on vs off (real-embedding user, 50 queries)
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | errors |
+|---|---|---|---|---|---|---|
+| run 1 [150k] e2e (NAS TEI, no rerank) | 50 | 209.6 | 312.8 | 454.8 | 544.1 | 0 |
+| [150k] e2e **rerank off** | 50 | **79.8** | **102.5** | 109.1 | 110.5 | 0 |
+| [150k] e2e **rerank on** (first pass: rerank cache cold) | 50 | **282.2** | **516.6** | 698.5 | 708.8 | 0 |
+| [pre-load] e2e rerank off | 50 | 93.5 | 107.7 | 148.5 | 171.6 | 0 |
+| [pre-load] e2e rerank on | 50 | 140.0 | 172.8 | 1708.4 | 3172.6 | 0 |
+| run 1 [150k] DB-only (relaxed_order) | 48 | 49.5 | 55.8 | 57.3 | 57.7 | 0 |
+| [150k] DB-only, deployed code (relaxed_order; rerank stage off in the probe) | 48 | **70.7** | **90.2** | 108.4 | 110.1 | 0 |
+| [150k] same, session GUC scan=off (only the candidate-count query differs — the deployed `recall()` SET LOCALs relaxed_order) | 48 | 72.5 | 94.3 | 98.6 | 101.5 | 0 |
+| [150k-bulk-user] e2e rerank off (4 %-share random-vector user) | 20 | 312.4 | 612.8 | 675.7 | 691.5 | 0 |
+| [150k-bulk-user] DB-only relaxed_order | 20 | 187.1 (run 1: 203.8) | 219.3 (269.1) | 243.7 | 249.8 | 0 |
+| [150k **+2000 edges**] e2e rerank off | 50 | 383.0 | 484.8 | 537.3 | 537.6 | 0 |
+| [150k +2000 edges] DB-only relaxed_order | 48 | 252.8 | 329.2 | 365.6 | 387.6 | 0 |
+
+Semantic hit-rate (expected predicate in the items, 20 probes): 1.0 at pre-load and 150 k both with and without rerank; 0.8 for the
+bulk user (0.75 in run 1; random vectors); 0.9 with 2 000 random edges (two misses — graph candidates displacing the seed's answer
+inside the budget is the mechanism to watch when real edges land). HNSW candidates for the 4 %-share user: **40/40** with the deployed
+relaxed_order (2.6/40 with the session GUC forced off — the run-1 starvation, confirmed fixed in the shipped code).
+
+DB-only per-step cost (in-container, ms p50 / p95; run 1 [150k] in the last column):
+
+| step | pre-load | 150k | 150k-bulk-user | 150k +2000 edges | run 1 150k |
+|---|---|---|---|---|---|
+| fact_vec(hnsw) | 37.5 / 38.9 | 22.2 / 25.2 | 108.8 / 132.6 | 31.9 / 42.6 | 25.0 / 30.4 |
+| fact_bm25(gin) | 2.8 / 6.4 | 5.9 / 11.4 | 4.8 / 13.1 | 4.6 / 12.7 | 4.7 / 9.6 |
+| episode_vec(hnsw) | 13.5 / 16.8 | 13.4 / 15.9 | 65.1 / 95.3 | 25.8 / 37.9 | 11.6 / 13.2 |
+| episode_bm25(gin) | 1.2 / 5.1 | 2.7 / 7.9 | 1.5 / 16.4 | 3.5 / 28.1 | 1.1 / 2.4 |
+| score+collapse(py) | 0.9 / 1.8 | 0.7 / 1.9 | 0.7 / 0.7 | 0.8 / 1.1 | 0.7 / 1.7 |
+| **graph_expand(sql)** (new) | **12.8 / 24.5** | **20.1 / 29.8** | 15.5 / 39.6 | **173.9 / 243.0** | – |
+| stale_hints(sql) | 1.2 / 2.9 | 1.3 / 3.0 | 1.7 / 5.5 | 0.0 / 5.4 | 1.3 / 4.1 |
+| snapshot+touch(sql) | 2.0 / 3.0 | 2.1 / 3.0 | 1.8 / 3.1 | 2.0 / 4.0 | 2.1 / 5.6 |
+
+Graph expansion with **zero edges in the store** still costs 13–20 ms p50 / 25–30 ms p95 per recall (a seed-subject lookup, the recursive
+CTE over an empty `edge` table, and one `_subject_facts` query per distinct seed subject, up to 10). That is the whole DB-only regression.
+The vector legs themselves are flat or better than run 1 (more `bench-real` rows now — 949 facts after the run's own writes — so the
+planner still chooses the btree+sort exact kNN for this user, 20 ms at ef_search=64).
+
+#### Concurrency sweep — `/recall` only, 60 s each, 150 k (run 1 in the first block)
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | req/s | errors |
+|---|---|---|---|---|---|---|---|
+| run 1: recall × 1 (NAS TEI) | 279 | 214.0 | 250.6 | 285.6 | 306.8 | 4.64 | 0 |
+| run 1: recall × 4 | 377 | 638.5 | 700.9 | 807.4 | 884.5 | 6.23 | 0 |
+| run 1: recall × 8 | 375 | 1290.6 | 1406.0 | 1542.2 | 2178.5 | 6.13 | 0 |
+| run 1: recall × 16 | 386 | 2557.1 | 2712.6 | 2951.2 | 3355.0 | 6.21 | 0 |
+| **rerank on, warm caches** × 1 | 701 | 85.1 | 113.9 | 139.1 | 178.9 | 11.68 | 0 |
+| rerank on, warm × 4 | 1220 | 195.4 | 250.4 | 291.9 | 337.2 | 20.31 | 0 |
+| rerank on, warm × 8 | 1222 | 389.1 | **500.2** | 548.9 | 618.4 | 20.3 | 0 |
+| rerank on, warm × 16 | 1224 | 786.8 | 928.7 | 991.9 | 1117.9 | 20.22 | 0 |
+| **rerank off, warm caches** × 1 | 708 | 84.2 | 109.1 | 138.2 | 165.2 | 11.79 | 0 |
+| rerank off, warm × 4 | 1253 | 189.9 | 241.4 | 293.3 | 336.9 | 20.87 | 0 |
+| rerank off, warm × 8 | 1258 | 378.6 | **492.7** | 546.2 | 592.7 | 20.9 | 0 |
+| rerank off, warm × 16 | 1253 | 769.0 | 909.1 | 962.1 | 1040.5 | 20.69 | 0 |
+| **rerank on, fresh queries** × 1 | 178 | 314.7 | 693.0 | 717.1 | 728.4 | 2.95 | 0 |
+| rerank on, fresh × 4 | 404 | 563.8 | 953.7 | 1074.2 | 1188.4 | 6.69 | 0 |
+| rerank on, fresh × 8 | 445 | 1007.8 | **1790.1** | 1971.4 | 2168.7 | 7.38 | 0 |
+| **rerank off, fresh queries** × 1 | 317 | 166.8 | 443.9 | 563.3 | 603.3 | 5.27 | 0 |
+| rerank off, fresh × 4 | 780 | 275.7 | 646.8 | 798.7 | 1172.3 | 12.91 | 0 |
+| rerank off, fresh × 8 | 713 | 683.5 | **1120.7** | 1161.8 | 1188.1 | 11.85 | 0 |
+
+Peaks (warm sweeps): `astoria` **109–146 % CPU** from 4 clients up (one uvicorn worker + threadpool, GIL-bound), `astoria-postgres` 92–121 %,
+`memoryos-tei` idle (1 %). Fresh sweeps: `astoria` 37–129 %, PG 14–78 % — the time goes to the workstation embed/rerank endpoints
+(22 embeds/s, 12 reranks/s). No OOM, 0 restarts.
+
+Reading: warm, rerank on and off are indistinguishable (the `(query, hook)` cache makes a repeated prompt's rerank free) and the ceiling is
+**~20 recalls/s = the service process**, not the store (DB-only below: 33 recalls/s on 8 connections) and not the embedder. Cold, the
+rerank stage adds ~0.3–0.7 s at 8 clients on top of the embed queueing.
+
+#### DB-only concurrency — the store alone (in-container, pre-embedded, rerank stage off), 20 s each
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | req/s | errors |
+|---|---|---|---|---|---|---|---|
+| run 1 real user × 8 (relaxed_order) | 866 | 183.9 | 238.7 | 274.2 | 306.7 | 43.1 | 0 |
+| real user × 1 | 238 | 87.8 | 116.5 | 130.4 | 173.1 | 11.85 | 0 |
+| real user × 4 | 556 | 142.1 | 187.6 | 210.7 | 234.6 | 27.67 | 0 |
+| real user × 8 | 670 | 237.0 | **296.7** | 327.1 | 531.0 | **33.27** | 0 |
+| real user × 16 | 662 | 479.3 | 590.4 | 635.1 | 707.3 | 32.66 | 0 |
+| bulk 4 %-share user × 1 (random vectors) | 86 | 229.5 | 292.5 | 319.7 | 323.3 | 4.29 | 0 |
+| bulk user × 4 | 236 | 335.6 | 410.4 | 442.1 | 481.4 | 11.66 | 0 |
+| bulk user × 8 | 253 | 620.0 | 842.7 | 1030.5 | 1143.3 | 12.42 | 0 |
+| bulk user × 16 | 258 | 1264.8 | 1705.4 | 1834.7 | 1900.7 | 12.44 | 0 |
+
+Peaks: PG 246 % (real user) / 592 % (bulk user), 814–824 MiB of 1 GiB; `astoria` (hosting the probe) 111–118 %. The store's own ceiling
+dropped from 44.6 to 33.3 recalls/s (8 conns) — again the extra graph-expansion queries per recall, not the vector legs.
+
+#### Mixed load — 8 recall + 4 capture + 2 POST /facts clients, 60 s, 150 k
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | req/s | errors |
+|---|---|---|---|---|---|---|---|
+| run 1: recall × 8 | 163 | 3096.8 | 3564.0 | 3678.1 | 3711.6 | 2.59 | 0 |
+| run 1: capture × 4 | 92 | 2748.1 | 3236.3 | 3350.1 | 3364.5 | 1.47 | 0 |
+| run 1: facts × 2 | 44 | 2864.1 | 3217.1 | 3453.2 | 3523.9 | 0.71 | 0 |
+| **rerank on**: recall × 8 | 859 | 465.3 | 722.8 | 3463.3 | **33677.0** | 9.96 | **3** |
+| rerank on: capture × 4 | 1127 | 183.4 | 306.0 | 746.5 | **30022.0** | 13.3 | **4** |
+| rerank on: facts × 2 | 455 | 232.2 | 368.2 | 831.3 | **30008.9** | 5.37 | **2** |
+| **rerank off**: recall × 8 | 793 | 402.8 | 594.7 | 2168.7 | 31701.4 | 11.99 | 0 |
+| rerank off: capture × 4 | 990 | 175.4 | 334.8 | 416.6 | 18618.9 | 14.97 | 0 |
+| rerank off: facts × 2 | 415 | 219.1 | 360.3 | 448.6 | 18622.9 | 6.28 | 0 |
+
+Peaks: `astoria` 115–143 %, PG 108–125 %, 654 MiB. Throughput is 4–10× run 1 and the medians are where the single-client numbers predict,
+but the tails are broken: the 9 errors are HTTP 500s — `psycopg.errors.DeadlockDetected` ×2 (`UPDATE fact SET access_count=…,last_seen=now() WHERE id = ANY($1)`
+from recall vs `UPDATE fact SET embedding=$1 WHERE id=$2 AND embedding IS NULL` from the backfill, PG log 22:47:59 and 22:48:00) and
+`psycopg_pool.PoolTimeout: couldn't get a connection after 30.00 sec` ×7 (requests logged at exactly 30 001 ms). The 18–34 s maxima in both
+runs are the same waits that did not hit the 30 s pool timeout. The `worker` control phase shows the same stall once with only 4 recall clients
+(max 25 888 ms) while the backlog from the mixed load was still draining.
+
+#### Belief-axis versioning — 20 concurrent and 50 sequential `/correct`, `/history`, `/as_of`
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | errors |
+|---|---|---|---|---|---|---|
+| `POST /correct` × 20 parallel, one key (run 1: 2 153 / 4 130) | 20 | 217.2 | 435.7 | 453.0 | 457.3 | 0 |
+| `POST /correct` × 50 sequential, one key | 50 | 13.3 | 54.0 | 56.9 | 57.6 | 0 |
+| `GET /history` on that API-built chain (len 50, active 1) | 20 | 12.6 | 18.5 | 18.6 | 18.6 | 0 |
+| `POST /as_of` scoped on it | 5 | 4.5 | 4.7 | 4.7 | 4.7 | 0 |
+| `POST /as_of` scoped + `as_believed_at` | 5 | 5.8 | 6.6 | 6.7 | 6.8 | 0 |
+| `GET /history` on the COPY-seeded 50-chain (`bench-u00`; run 1: 22.2 / 37.8) | 20 | 24.8 | 42.4 | 45.5 | 46.3 | 0 |
+| `POST /as_of` scoped (seeded chain; run 1: 5.9 / 6.5) | 5 | 3.9 | 4.8 | 4.9 | 5.0 | 0 |
+| `POST /as_of` unscoped, whole user, limit 50 (run 1: 23.8 / 58.8) | 5 | 26.8 | 43.7 | 46.8 | 47.5 | 0 |
+
+Row accounting for the 50-correct key: **99 rows in `fact`** = 1 active + 49 `superseded` belief-closed originals (`meta.belief_closed_by`)
++ 49 `superseded` versioned copies (`meta.version_of`) → **1.98 rows per `/correct`** (was 1.0). `/history` hides the belief-closed
+originals, so the chain reads as 50; `/as_of` with and without `as_believed_at` stays 4–7 ms on `fact_key`. After 20 concurrent corrects:
+API 1 active, DB 1 active, history 20 — **PASS**, and 9.5× faster than run 1 because the embed now happens before the per-key lock (and
+is async).
+
+#### Worker interference — recall × 4 while cognify drains 100 turns (150 k)
+
+| case | n | p50 ms | p95 ms | p99 ms | max ms | req/s | errors |
+|---|---|---|---|---|---|---|---|
+| recall × 4, worker idle (control; run 1: 649.9 / 841.2) | 806 | 189.5 | 263.7 | 334.1 | 25887.6 | 13.41 | 0 |
+| capture cognify=true × 100 (enqueue; run 1: 251.7 / 377.2) | 100 | 7.4 | 10.2 | 11.5 | 12.2 |  | 0 |
+| recall × 4, worker draining (run 1: 635.4 / 753.4) | 1204 | 192.1 | 273.0 | 334.8 | 940.5 | 20.03 | 0 |
+
+Queue 100 → 96 pending in 60 s (cloud LLM, 4 jobs/min, as in run 1); p95 +9 ms while draining — the cognify worker still does not
+interfere. The 25.9 s outlier in the *control* is the backfill-transaction lock wait described above (PG at 210 % draining ~900 rows), not
+cognify.
+
+#### EXPLAIN (ANALYZE, BUFFERS) summaries, 150 k
+
+| query | real-embedding user (scan) | exec ms | buffers | 4 %-share bulk user (scan) | exec ms | buffers |
+|---|---|---|---|---|---|---|
+| fact vector (ef_search=64, iterative_scan=off) | btree+sort (`fact_user_status`) | 27.4 | hit 7 620 | HNSW `fact_vec` | 6.1 (rows=0) | hit 906 read 4 |
+| fact vector (ef_search=64, relaxed_order) | btree+sort | 20.4 | hit 7 559 | HNSW | **127.6** | hit 15 334 read 10 395 |
+| fact vector (ef_search=40 default) | btree+sort | 9.5 | hit 7 559 | HNSW | 1.4 (rows=0) | hit 716 |
+| fact BM25 (GIN) | BitmapAnd(user_status, tsv) | 1.7 | hit 126 | GIN | 1.8 | hit 141 read 10 |
+| episode vector (ef_search=64) | bitmap `episode_user_time` + sort | 7.3 | hit 1 979 | HNSW `episode_vec` | 1.1 | hit 569 |
+| episode BM25 (GIN) | GIN | 1.3 | hit 164 | GIN | 0.4 | hit 16 read 19 |
+| history (fact_key) | fact_key | 0.03 | hit 3 | fact_key | 0.05 | hit 1 read 2 |
+| as_of unscoped (limit 50) | fact_key | 0.5 | hit 128 | fact_key | 0.3 | hit 75 |
+| stale_hints (1 key) | BitmapAnd(user_time, tsv) | 0.5 | hit 57 | GIN | 0.3 | hit 25 |
+
+Same plan shapes as run 1 (full plans in the JSONL). The relaxed-order probe for the bulk user is the cold-cache case again (10 395 page
+reads, 128 ms); warm it is 104 ms p50 / 116 ms p95 for 40/40 candidates (`filter` phase; 125 / 250 in run 1).
+
+#### Deep load, sizes, cleanup
+
+| users | facts | facts/s | episodes | episodes/s | VACUUM ANALYZE s |
+|---|---|---|---|---|---|
+| 20 (resumed part after the mid-load restart: users 4–19) | 80 006 | 104 | 40 000 | 118 | 2.5 |
+| combined with users 0–3 | 100 012 | **109** | 50 000 | **122** | – |
+
+Sizes after the run (db total 1 371 MB; run 1 1 320 MB): `fact` 101 546 rows / 887 MB (heap 54, TOAST 401, `fact_vec` 397 MB) = **8.7 KB/row**;
+`episode` 51 488 / 463 MB (`episode_vec` 201 MB) = 9.0 KB/row; the new `fact_supersedes` / `fact_superseded_by` partial indexes are
+480 / 424 kB; `snapshot` grew to 20 748 rows / 9 MB from ~22 000 recalls (one row each — prune_snapshots at 90 days keeps it bounded).
+HOT update ratio after the run: `fact` **96.0 %** (323 274 / 336 640 — fillfactor 90 holds under 22 000 recalls' touch-updates);
+`episode` 21.6 % (the backfill's 3 KB vector UPDATEs go to TOAST and are not HOT by nature; autovacuum ran 27× on `episode`, 72× on
+`fact` at the 0.02 scale factor — no bloat: 50–263 dead tuples at the end).
+
+Cleanup (`seed.py --wipe`, chain indexes in place, 003 tables included): **101 348 facts + 51 454 episodes + 1 989 edges + 19 953 snapshots
++ 3 841 audit + 229 tombstones + 100 queue rows deleted in 11.7 s** (run 1: 7.1 + 5.4 s for fact + episode alone); all `bench-*` counts
+0 afterwards across `fact, episode, edge, entity, alias, snapshot, audit, cognify_queue, tombstone, profile, profile_history` and the
+30 bench predicates; the live user's rows untouched (200 fact rows / 140 active, 35 episodes before and after).
+
+### 7.3 Verdict vs thresholds (report.py, run 2 JSONL)
+
+| threshold | measured | result |
+|---|---|---|
+| recall p95 < 500 ms e2e, 8 concurrent clients, at scale (service default = rerank on, warm caches) | 500.2 | FAIL (by 0.2 ms) |
+|   recall p95 < 500 ms e2e, 8 concurrent clients [rerank off, warm] | 492.7 | PASS |
+|   (info) same, rerank on, fresh queries (caches cold) | 1790.1 | short |
+|   (info) same, rerank off, fresh queries | 1120.7 | short |
+|   (info) recall p95 e2e, 1 client, rerank on (cold rerank cache) / off | 516.6 / 102.5 | short / ok |
+| DB-only recall p95 < 80 ms at scale (deployed code, relaxed_order) | 90.2 | FAIL |
+| capture p95 < 400 ms (1 client, at scale) | 8.0 | PASS |
+|   (info) capture p95 under mixed load | 306.0 (rerank on) / 334.8 (off) | ok |
+| zero HTTP errors across all phases | 9 | FAIL |
+| no container OOM kill | 0 | PASS |
+| exactly 1 active under 20 concurrent /correct | True | PASS |
+|   (info) async embed: every new row embedded within 60 s | 24.1 s idle; > 121 s with a write backlog | ok / short |
+|   (info) DB-only recall p95, 8 parallel connections, real user / 4 %-share user | 296.7 / 842.7 | ok / short |
+|   (info) HNSW candidates of 40 for the 4 %-share user, deployed code | 40.0 | ok |
+
+### 7.4 Defects / regressions found by run 2
+
+| id | defect | evidence | fix (not applied in this pass) |
+|---|---|---|---|
+| **A** | **Graph expansion runs on every recall even when the user has no edges**, costing 13–20 ms p50 / 25–30 ms p95 (seed-subject lookup + recursive CTE over an empty `edge` + up to 10 `_subject_facts` queries); with 2 000 edges it is 174 / 243 ms and dominates recall | DB-only step table; DB-only p95 56 → 90 ms; 8-conn store ceiling 44.6 → 33.3 recalls/s | skip the stage when `NOT EXISTS (SELECT 1 FROM edge WHERE user_id=%s AND status='active')` (one indexed probe, or a per-user flag cached for the worker tick); fold the per-subject fan-out into one `= ANY(subjects)` query; cap `_subject_facts` to the top-3 seed subjects; consider `graph_max_depth=1` as the recall default and depth 2 for `/graph` |
+| **B** | **`embed_backfill` is one transaction per tick** (≤200 facts + 200 episodes, embeds inside the txn): under load the txn lasts ~30 s and holds row locks that recall's touch-UPDATE waits on → 18–34 s stalls, 2 deadlocks, 7 `PoolTimeout` 500s in the mixed load, one 25.9 s stall with 4 clients | PG log deadlocks (recall touch-UPDATE vs backfill UPDATE), service tracebacks, backfill ticks 60 s apart, mixed-load maxima 30 001 ms | commit per batch of 8 (embed outside the txn, then a ≤10 ms UPDATE txn); order both UPDATE sets by `id` (no deadlock); make the touch-update non-blocking (`… WHERE id IN (SELECT id FROM fact WHERE id = ANY(%s) FOR UPDATE SKIP LOCKED)`) or move it off the request path (batch touches in the worker); raise pool max to ≥ 16 and set `getconn` timeout < the client timeout |
+| **C** | **Backfill throughput ≈ 4–7 rows/s sustained** (200 + 200 rows per 30 s tick, sequential batches of 8 to the embedder, HNSW insert per row) — any burst above that grows the BM25-only window far past the 30 s design intent (episodes still un-embedded 121 s after a 60 s mixed load) | `embed-gap` 150 k; backfill log; real seed 500 rows = 100 s | embed batches concurrently (the workstation seat does 22/s at 8-way), raise the per-tick limit when `pending` is high, and let the tick loop re-run immediately while `pending > 0` instead of sleeping 30 s; expose `pending_facts/episodes` in `/health` so clients can see the gap |
+| **D** | **Single uvicorn worker is the warm-path ceiling** (~20 recalls/s at 110–146 % CPU; 8 clients p95 ≈ 500 ms on the line) | concurrency sweeps, `astoria` CPU peaks; DB-only store does 33/s and the embedder 22/s | 2 uvicorn workers (the worker loop is already leader-elected by advisory lock 43) or `--workers` with the pool per process; send the 768-d query vector once per transaction (it is serialised twice per vector query today — 15 KB text each — `fact_vec`+`episode_vec` = 4 dumps per recall; pass it as a CTE param or binary); skip `_stale_hints`/touch for `facts_only` |
+| **E** | Rerank p99/max outliers: 1.7 s / 3.2 s at pre-load, 0.7 s at 150 k single-client (cold `(query, hook)` cache; workstation endpoint shared with a busy host); NAS fallback is 3× slower and caps at 2.9 calls/s | `rerank-floor`, `recall` rerank-on rows | keep `rerank_timeout_s` ≤ 1 s on the read path (base ranking is good: hit-rate 1.0 either way here); rerank only when the candidate pool has > N items or when the top-2 scores are close; pin the reranker to a GPU seat if the workstation is on anyway |
+| **F** (harness) | a `BENCH_DSN` export silently moved the DB-only probe onto the ssh tunnel (375 ms "DB-only" recalls that were 70 ms) | first pre-load pass, discarded | `loadgen.py` now always uses the in-container exec path unless `BENCH_DB_EXEC=""` is set explicitly; README updated |
+
+### 7.5 Growth projection update (1 M facts / 500 k episodes)
+
+Per-row costs are unchanged (8.7 KB/fact, 9.0 KB/episode incl. HNSW; 109 / 122 rows/s in-place HNSW insert at 100 k), so the §4 size
+and cache-knee projections stand: **≈ 13 GB at 1 M + 500 k, HNSW ≈ 5.9 GB, and the 1 GiB PG cgroup stops holding the hot graph at
+~170–200 k embedded rows** — the mitigation list in §4 (PG `mem_limit` 2–3 GiB + `shared_buffers` 768 MB–1 GB, `halfvec` HNSW, stop
+embedding raw turns) is still the order of business before the store passes ~150 k. What this run changes in the projection:
+
+| metric | run 1 basis | run 2 | projection note |
+|---|---|---|---|
+| rows per correction | 1 | **1.98** (belief-axis copy) | a user correcting 50 keys/day adds ~100 rows/day ≈ 0.9 MB/day with vectors — negligible vs episodes, but the versioned copies carry a full 3 KB embedding each; consider `embedding=NULL` on versioned copies (they are never recalled: `status='superseded'`) to halve that |
+| write path | 234–289 ms, TEI-bound | 6–11 ms, store-bound | unchanged by store size (HNSW insert ≈ 5–8 ms is now inside the backfill, not the request); the **backfill rate (≈ 4–7 rows/s, defect C) is the real write ceiling** — 1 M facts of organic growth is fine (≤ 0.1 rows/s), a bulk import is not: use `seed.py --index-mode rebuild` or a one-off backfill with concurrency |
+| recall DB-only | 49 / 56 ms | 71 / 90 ms (graph +20 ms) | HNSW cost still ~log N (×1.15 to 1 M); graph expansion is O(edges touched), not O(rows) — with real edges it is the dominant term (174 ms at 2 000 edges on one user) and must be gated (defect A) |
+| recall e2e ceiling | 6.2 req/s (NAS TEI) | ~20 req/s warm (service CPU) / 7–12 req/s cold (workstation seat + reranker) | independent of store size; the next step is process count (defect D) and keeping the workstation endpoints on |
+| `snapshot` | 770 rows | 20 748 rows / 9 MB for 22 k recalls | 1 row per recall: at 10 k recalls/day that is 0.4 MB/day — `prune_snapshots(90 d)` bounds it at ~40 MB |
+
+### 7.6 Risks & mitigations (updated)
+
+1. **Reranker cost: NAS CPU vs workstation.** Workstation: 116 ms / 30 hooks, ~12 calls/s; NAS: 324 ms, ~2.9 calls/s. With the workstation
+   off, every cold recall pays +0.3 s and the stage alone caps recall below 3 req/s; with it on, a cold 8-client burst still queues
+   (1.8 s p95). The cache makes repeated prompts free (warm: rerank on = rerank off). Mitigations: short read-path timeout (≤ 1 s, degrade to
+   base ranking), rerank only when it can change the answer (pool > N, close top scores), keep hooks capped at 240 chars (done), and expect
+   the NAS reranker to be a correctness fallback, not a capacity tier.
+2. **Async-embed recall gap.** Design intent ≤ 30 s; measured 24 s idle, 37 s at 150 k, **> 121 s after a 60 s burst** because the backfill
+   drains at ~4–7 rows/s in 30 s transactions. Until defect B/C land: keep `sync:true` for the few writes that must be recallable
+   immediately (explicit `/remember`, `/correct` — the detector path), and read `pending_facts/episodes` from the backfill log (or expose it
+   in `/health`) to alarm on a growing backlog. The same transaction shape is what produces the lock waits, deadlocks and pool timeouts —
+   fixing B fixes both.
+3. **Belief-axis row growth.** 2 rows per supersede (was 1); `/history`/`/as_of` stay on `fact_key` (4–25 ms) because the belief-closed
+   originals are filtered by `meta ? 'belief_closed_by'` in SQL. Growth is proportional to corrections, not to recalls; the only cost worth
+   pre-empting is the duplicated 3 KB vector on the versioned copy (never searched — drop it) and the two extra HNSW inserts per correction
+   in the backfill.
+4. **Graph expansion is unbounded by store size but bounded by edge density** — and today it is paid with zero edges. Gate it (defect A)
+   before edges start landing from cognify; with real edges budget ~1–3 ms per edge touched at fanout 20 / depth 2.
+5. **Service process ceiling (~20 recalls/s).** One uvicorn worker, Python-side vector serialisation, and the recall txn holding a pool
+   connection across the embed + rerank HTTP calls. Two workers and a 16-connection pool roughly double the warm ceiling; keeping external
+   calls outside the DB transaction shortens connection hold time and removes the 30 s pool-timeout failure mode.
+6. Still open from run 1: the HNSW working set vs the 1 GiB PG cgroup on spinning disks (cold probes at 0.13–1.4 s with 10 k page reads are
+   still visible in the bulk-user EXPLAIN), and filtered-HNSW cost for minority users (relaxed_order fixes correctness; 4 %-share user DB-only
+   187 / 219 ms, 8 conns 843 ms p95 — partial per-user HNSW indexes or partitioning when several heavy users share the store).
+
+### 7.7 Harness changes in this pass
+
+`loadgen.py`: global `--rerank on|off` (adds the request flag to every `/recall`) and `--unique` (nonce per query → cold caches); new
+phases `embed-floor`, `rerank-floor`, `embed-gap`, `correct-seq`; `baseline` also measures `sync:true` writes; the in-container probe is the
+unconditional default (`BENCH_DB_EXEC` must be set to `""` explicitly to run locally). `db_probe.py`: DB-only recall passes `rerank=False`
+(store-only numbers) and the step breakdown includes `graph_expand(sql)`. `seed.py`: `--edges N --edges-user U` seeds random active edges;
+`--wipe` also clears `edge`/`entity`/`alias`. `report.py`: renders the new phases, a verdict row per concurrency label (rerank on/off both
+hard, fresh-query sweeps informational), and the async-embed window.
+
 
 ## How to re-run
 
 See `scripts/bench/README.md` (environment variables, the exact command sequence, and the thresholds encoded in
-`scripts/bench/report.py`). Raw records for this run: `scripts/bench/results/2026-08-22.jsonl`; the rerank
+`scripts/bench/report.py`). Raw records: run 1 `scripts/bench/results/2026-08-22.jsonl`, run 2
+`scripts/bench/results/2026-08-22-run2.jsonl` (`report.py <file>` reproduces the tables of either run); the rerank
 evaluation is `scripts/bench/rerank_eval.py --mode exec --json out.json`.
+
+### 7.8 Fixes applied after run 2 (deployed; verified by the acceptance + smoke suites, re-measure on the next run)
+- **A — graph expansion gate:** recall checks (60 s per-user cache) whether the user has any active edges before
+  running the expansion query; users without a graph no longer pay the +13–20 ms.
+- **B/C — embedding backfill:** rewritten as short transactions (≤8 rows each, `FOR UPDATE SKIP LOCKED`,
+  committed per batch, 20 s time budget, up to 1000 rows per table per tick) — recall's touch-updates no longer
+  wait on a long backfill transaction, and the post-burst un-embedded window shrinks to about one tick.
+- **D — service concurrency:** the container now runs two uvicorn workers (the cognify/curator loop still runs in
+  exactly one process via the leader advisory lock); raises the warm ceiling above ~20 recalls/s.

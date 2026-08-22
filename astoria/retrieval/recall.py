@@ -147,6 +147,23 @@ def _episode_weight(r: dict, now: datetime) -> float:
     return 0.25 + 0.25 * rec + 0.25 * float(r.get("importance") or 0.0) + 0.25 * EPISODE_TRUST
 
 
+_EDGE_CACHE: dict[str, tuple[bool, float]] = {}   # user_id -> (has_active_edges, checked_at)
+
+
+def _user_has_edges(c: psycopg.Connection, user_id: str, ttl_s: float = 60.0) -> bool:
+    """Cheap gate so users without a graph never pay the expansion query (measured +13–20 ms)."""
+    import time as _t
+    hit = _EDGE_CACHE.get(user_id)
+    if hit and _t.time() - hit[1] < ttl_s:
+        return hit[0]
+    try:
+        has = c.execute("SELECT 1 FROM edge WHERE user_id=%s AND status='active' LIMIT 1", (user_id,)).fetchone() is not None
+    except Exception:  # noqa: BLE001 — table missing etc.
+        has = False
+    _EDGE_CACHE[user_id] = (has, _t.time())
+    return has
+
+
 def _rrf(*ranked: Iterable[dict]) -> dict[Any, tuple[float, dict]]:
     """Reciprocal-rank fusion over several ranked row lists → {id: (rrf, row)}."""
     out: dict[Any, tuple[float, dict]] = {}
@@ -470,7 +487,8 @@ def recall(c: psycopg.Connection, *, user_id: str, query: str, session_id: str |
     epi_rows = _score_episodes(_rrf(epi_vec, epi_bm), now)
 
     # --- graph expansion: facts reachable from the top seeds via edges/entities (bounded) ------
-    if fact_rows and at is None and int(getattr(settings(), "graph_max_depth", 2) or 0) > 0:
+    if fact_rows and at is None and int(getattr(settings(), "graph_max_depth", 2) or 0) > 0 \
+            and _user_has_edges(c, user_id):
         try:
             from astoria.retrieval.graph import expand_candidates
             seeds = [r["id"] for r in fact_rows[:10]]

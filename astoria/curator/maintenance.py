@@ -41,33 +41,45 @@ CURATOR_ACTOR = "curator"
 # ---------------------------------------------------------------------------
 # embeddings
 
-def embed_backfill(c: psycopg.Connection, limit: int = 200) -> dict:
-    """Embed up to `limit` facts + `limit` episodes whose embedding is NULL. Returns counts."""
+def _backfill_table(c: psycopg.Connection, table: str, batch: int) -> int:
+    """One short transaction: claim ≤batch NULL-embedding rows (SKIP LOCKED so recall's touch-updates never
+    wait on us), embed, write, COMMIT. Returns rows embedded (0 = nothing claimable)."""
+    rows = c.execute(
+        f"SELECT id, hook FROM {table} WHERE embedding IS NULL AND status <> 'deleted' "
+        "ORDER BY ingested_at LIMIT %s FOR UPDATE SKIP LOCKED", (batch,)).fetchall()
+    if not rows:
+        c.commit()
+        return 0
+    vecs = embed_texts([r["hook"] for r in rows])
+    n = 0
+    for r, v in zip(rows, vecs):
+        if v is not None:
+            c.execute(f"UPDATE {table} SET embedding=%s WHERE id=%s AND embedding IS NULL", (v, r["id"]))
+            n += 1
+    c.commit()
+    if n == 0:  # embedder down: don't spin
+        return -1
+    return n
+
+
+def embed_backfill(c: psycopg.Connection, limit: int = 200, *, time_budget_s: float = 20.0) -> dict:
+    """Fill NULL embeddings left by the async write path. Works in SHORT transactions (≤EMBED_BATCH rows
+    each, committed immediately) so it never holds row locks across a slow embedder call, and stops at
+    `limit` rows per table or `time_budget_s`. Returns counts + remaining backlog."""
+    import time as _t
     done = {"facts": 0, "episodes": 0, "pending_facts": 0, "pending_episodes": 0}
-    facts_rows = c.execute(
-        "SELECT id, hook FROM fact WHERE embedding IS NULL AND status <> 'deleted' ORDER BY ingested_at LIMIT %s",
-        (limit,)).fetchall()
-    for i in range(0, len(facts_rows), EMBED_BATCH):
-        chunk = facts_rows[i:i + EMBED_BATCH]
-        vecs = embed_texts([r["hook"] for r in chunk])
-        for r, v in zip(chunk, vecs):
-            if v is not None:
-                c.execute("UPDATE fact SET embedding=%s WHERE id=%s AND embedding IS NULL", (v, r["id"]))
-                done["facts"] += 1
-    ep_rows = c.execute(
-        "SELECT id, hook FROM episode WHERE embedding IS NULL AND status <> 'deleted' ORDER BY ingested_at LIMIT %s",
-        (limit,)).fetchall()
-    for i in range(0, len(ep_rows), EMBED_BATCH):
-        chunk = ep_rows[i:i + EMBED_BATCH]
-        vecs = embed_texts([r["hook"] for r in chunk])
-        for r, v in zip(chunk, vecs):
-            if v is not None:
-                c.execute("UPDATE episode SET embedding=%s WHERE id=%s AND embedding IS NULL", (v, r["id"]))
-                done["episodes"] += 1
+    t0 = _t.time()
+    for table, key in (("fact", "facts"), ("episode", "episodes")):
+        while done[key] < limit and _t.time() - t0 < time_budget_s:
+            n = _backfill_table(c, table, EMBED_BATCH)
+            if n <= 0:
+                break
+            done[key] += n
     done["pending_facts"] = c.execute(
         "SELECT count(*) AS n FROM fact WHERE embedding IS NULL AND status <> 'deleted'").fetchone()["n"]
     done["pending_episodes"] = c.execute(
         "SELECT count(*) AS n FROM episode WHERE embedding IS NULL AND status <> 'deleted'").fetchone()["n"]
+    c.commit()
     return done
 
 

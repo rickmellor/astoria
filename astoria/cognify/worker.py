@@ -36,7 +36,7 @@ GROUP_MAX_EPISODES = 8
 GROUP_MAX_CHARS = 6000
 BODY_MAX_CHARS = 6000
 STALE_RUNNING_MIN = 30
-EMBED_BACKFILL_LIMIT = 200    # rows per tick (facts + episodes), batched 8 → TEI
+EMBED_BACKFILL_LIMIT = 1000    # rows per tick (facts + episodes), batched 8 → TEI
 
 
 def backoff_minutes(attempts: int) -> int:
