@@ -1,6 +1,7 @@
 # Astoria on the NAS — /volume1/docker/astoria
-#   astoria-postgres : pgvector/pgvector:pg18, data in ./pgdata (bind mount, in backup scope)
-#   astoria          : the service (REST :8933 + MCP /mcp) + in-container workers
+#   astoria-postgres : pgvector/pgvector:pg18, data in ./pgdata (bind mount)
+#   astoria          : the service (REST :8933 + MCP /mcp/) + in-process workers
+#   astoria-backup   : pg_dump sidecar → ./backups (every 6h, keep 14) — no cron/sudo needed on UGOS
 # Embeddings come from the existing always-on TEI nomic container (memoryos-tei, :8931)
 # via the host IP — separate compose, same NAS (the MegaPlan→MemoryOS pattern).
 services:
@@ -8,16 +9,19 @@ services:
     image: pgvector/pgvector:pg18
     container_name: astoria-postgres
     env_file: .env                      # POSTGRES_PASSWORD / POSTGRES_USER / POSTGRES_DB
+    command: ["postgres", "-c", "shared_buffers=256MB", "-c", "maintenance_work_mem=128MB"]
     volumes:
-      - ./pgdata:/var/lib/postgresql    # pg18 image uses /var/lib/postgresql (not /data)
+      - ./pgdata:/var/lib/postgresql    # pg18 image: PGDATA=/var/lib/postgresql/18/docker
     ports:
-      - "127.0.0.1:8934:5432"           # local-only; the service reaches it on the compose net
+      - "127.0.0.1:8934:5432"           # local-only (docker exec / psql on the NAS)
     shm_size: 256m
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-astoria} -d ${POSTGRES_DB:-astoria}"]
       interval: 15s
       timeout: 5s
       retries: 10
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
     restart: unless-stopped
 
   astoria:
@@ -29,11 +33,42 @@ services:
     environment:
       ASTORIA_DB_DSN: postgresql://${POSTGRES_USER:-astoria}:${POSTGRES_PASSWORD}@astoria-postgres:5432/${POSTGRES_DB:-astoria}
     volumes:
-      - ./backups:/backups              # pg_dump rotation written by the in-container scheduler
       - ./data:/data                    # importer staging, logs
     ports:
       - "8933:8933"
+    mem_limit: 768m
     depends_on:
       astoria-postgres:
         condition: service_healthy
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    restart: unless-stopped
+
+  astoria-backup:
+    image: pgvector/pgvector:pg18       # has pg_dump matching the server major
+    container_name: astoria-backup
+    env_file: .env
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_INTERVAL_S: ${BACKUP_INTERVAL_S:-21600}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 60
+        while :; do
+          f=/backups/astoria-$$(date +%F-%H%M).dump
+          if pg_dump -Fc -h astoria-postgres -U "$${POSTGRES_USER:-astoria}" "$${POSTGRES_DB:-astoria}" > "$$f.tmp"; then
+            mv "$$f.tmp" "$$f"; echo "backup ok $$f"
+            ls -1t /backups/*.dump 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+          else
+            echo "backup FAILED"; rm -f "$$f.tmp"
+          fi
+          sleep "$$BACKUP_INTERVAL_S"
+        done
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      astoria-postgres:
+        condition: service_healthy
+    logging: { driver: json-file, options: { max-size: "5m", max-file: "2" } }
     restart: unless-stopped
