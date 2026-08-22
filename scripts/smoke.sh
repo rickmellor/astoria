@@ -10,8 +10,9 @@ ASTORIA_URL="${ASTORIA_URL:-http://192.168.1.134:8933}"
 ASTORIA_URL="${ASTORIA_URL%/}"
 USER_ID="smoke-$RANDOM$RANDOM"
 CLIENT_HDR="X-Astoria-Client: smoke"
-CURL="curl -sS -m 30 -H Content-Type:application/json -H $CLIENT_HDR"
 fails=0
+# curl with the JSON + client headers (a function, not a string — header values contain spaces)
+CURL() { curl -sS -m 30 -H 'Content-Type: application/json' -H "$CLIENT_HDR" "$@"; }
 
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails+1)); }
@@ -66,33 +67,33 @@ fi
 rm -f "$hdrs" "$body"
 
 # --- 3. T1 quick: facts → correct → recall ---------------------------------------------------------
-r=$($CURL -X POST "$ASTORIA_URL/facts" -d "{\"user_id\":\"$USER_ID\",\"subject\":\"$USER_ID\",\"predicate\":\"favorite_beer\",\"value\":\"Guinness\"}")
+r=$(CURL -X POST "$ASTORIA_URL/facts" -d "{\"user_id\":\"$USER_ID\",\"subject\":\"$USER_ID\",\"predicate\":\"favorite_beer\",\"value\":\"Guinness\"}")
 act=$(printf '%s' "$r" | jget action); old_id=$(printf '%s' "$r" | jget fact.id)
 [ "$act" = "inserted" ] && pass "POST /facts Guinness → inserted" || { fail "POST /facts → ${act:-err}: $(printf '%s' "$r" | head -c 200)"; }
-r=$($CURL -X POST "$ASTORIA_URL/correct" -d "{\"user_id\":\"$USER_ID\",\"subject\":\"$USER_ID\",\"predicate\":\"favorite_beer\",\"value\":\"IPA\"}")
+r=$(CURL -X POST "$ASTORIA_URL/correct" -d "{\"user_id\":\"$USER_ID\",\"subject\":\"$USER_ID\",\"predicate\":\"favorite_beer\",\"value\":\"IPA\"}")
 act=$(printf '%s' "$r" | jget action); sup=$(printf '%s' "$r" | jget superseded)
 if [ "$act" = "superseded" ] && printf '%s' "$sup" | grep -q "$old_id"; then pass "POST /correct IPA → superseded $old_id"; else fail "POST /correct → ${act:-err}: $(printf '%s' "$r" | head -c 200)"; fi
-r=$($CURL "$ASTORIA_URL/facts?user_id=$USER_ID&predicate=favorite_beer&status=active")
+r=$(CURL "$ASTORIA_URL/facts?user_id=$USER_ID&predicate=favorite_beer&status=active")
 vals=$(printf '%s' "$r" | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d.get("facts",d) if isinstance(d,dict) else d; print(",".join(sorted(f["value"] for f in d)))' 2>/dev/null)
 [ "$vals" = "IPA" ] && pass "GET /facts active == [IPA]" || fail "GET /facts active == [$vals]"
-r=$($CURL "$ASTORIA_URL/facts/$old_id?user_id=$USER_ID")
+r=$(CURL "$ASTORIA_URL/facts/$old_id?user_id=$USER_ID")
 st=$(printf '%s' "$r" | jget status); sb=$(printf '%s' "$r" | jget superseded_by)
 [ "$st" = "superseded" ] && [ -n "$sb" ] && pass "old row superseded (superseded_by=$sb)" || fail "old row status=$st superseded_by=$sb"
-r=$($CURL -X POST "$ASTORIA_URL/recall" -d "{\"user_id\":\"$USER_ID\",\"query\":\"what beer do I like\"}")
+r=$(CURL -X POST "$ASTORIA_URL/recall" -d "{\"user_id\":\"$USER_ID\",\"query\":\"what beer do I like\"}")
 top=$(printf '%s' "$r" | jget items.0.value); ctx=$(printf '%s' "$r" | jget context)
 if printf '%s' "$ctx" | grep -q Guinness; then fail "recall context still mentions Guinness"; fi
 if [ "$top" = "IPA" ]; then pass "POST /recall items[0].value == IPA"; else
   if printf '%s' "$ctx" | grep -q IPA; then pass "POST /recall context mentions IPA (top=$top)"; else fail "POST /recall top=$top ctx=$(printf '%s' "$ctx" | head -c 120)"; fi
 fi
 # detector path (no LLM)
-r=$($CURL -X POST "$ASTORIA_URL/capture" -d "{\"user_id\":\"$USER_ID\",\"kind\":\"note\",\"text\":\"Actually, my favorite beer is stout\",\"cognify\":false}")
+r=$(CURL -X POST "$ASTORIA_URL/capture" -d "{\"user_id\":\"$USER_ID\",\"kind\":\"note\",\"text\":\"Actually, my favorite beer is stout\",\"cognify\":false}")
 dv=$(printf '%s' "$r" | jget detector.value); da=$(printf '%s' "$r" | jget detector.action)
 [ "$dv" = "stout" ] && pass "capture detector → favorite_beer=stout ($da)" || fail "capture detector: $(printf '%s' "$r" | head -c 200)"
 
 # --- 4. wipe --------------------------------------------------------------------------------------
 code=$(curl -s -m 30 -o /dev/null -w '%{http_code}' -X DELETE -H "$CLIENT_HDR" "$ASTORIA_URL/users/$USER_ID" 2>/dev/null || echo 000)
 [ "$code" = "200" ] && pass "DELETE /users/$USER_ID" || fail "DELETE /users/$USER_ID HTTP $code"
-r=$($CURL "$ASTORIA_URL/facts?user_id=$USER_ID&status=any")
+r=$(CURL "$ASTORIA_URL/facts?user_id=$USER_ID&status=any")
 n=$(printf '%s' "$r" | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d.get("facts",d) if isinstance(d,dict) else d; print(len(d))' 2>/dev/null)
 [ "$n" = "0" ] && pass "user wiped (0 facts)" || fail "user still has $n facts after wipe"
 
