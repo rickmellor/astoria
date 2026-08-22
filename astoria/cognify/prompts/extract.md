@@ -66,6 +66,17 @@ You are given:
     `[]` and `summary` is `null`.
 14. Extract facts that are already in CANDIDATE FACTS again only if the text restates them (this
     corroborates them); use the same subject/predicate/value spelling so they match.
+15. **`edges`** (optional, usually empty). A typed link between two SUBJECTS that the text states
+    outright and that is not already captured as a fact value — `part_of`, `located_in`, `works_at`,
+    `owns`, `runs_on`, `depends_on`, `member_of`, `related_to` (snake_case). `src`/`dst` are subject
+    names (same spelling rules as rule 1) or `"fact:N"` = the N-th entry of this reply's `facts`
+    (counting from 1) when one fact belongs to / elaborates another. Never invent relations; when in
+    doubt emit no edge. Same `confidence` scale as facts.
+16. **`aliases`** (optional, usually empty). Only when the text CLEARLY says two names denote the
+    same thing — a rename ("johnny is now called nova"), an "aka"/"a.k.a.", "formerly", or an
+    abbreviation the user defines ("the NAS (ugreen-dxp4800)"): `{"alias": "<other name>",
+    "canonical": "<name to keep>"}`, both lower-case; prefer the candidate-list spelling as canonical.
+    Never alias the user themself, and never guess from mere similarity.
 
 ## Output — STRICT JSON matching this schema
 
@@ -95,10 +106,38 @@ You are given:
           "evidence":    {"type": ["string", "null"]}
         }
       }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["src", "relation", "dst"],
+        "properties": {
+          "src":        {"type": "string", "description": "subject name or fact:N (1-based index into facts)"},
+          "relation":   {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+          "dst":        {"type": "string"},
+          "confidence": {"type": "number", "minimum": 0.3, "maximum": 0.85},
+          "evidence":   {"type": ["string", "null"]}
+        }
+      }
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["alias", "canonical"],
+        "properties": {
+          "alias":     {"type": "string"},
+          "canonical": {"type": "string"},
+          "evidence":  {"type": ["string", "null"]}
+        }
+      }
     }
   }
 }
 ```
+
+`edges` and `aliases` may be omitted or `[]` — most exchanges have none.
 
 Example (USER_ID `rick`, candidate `7f…` = `rick favorite_beer Guinness`):
 
@@ -114,7 +153,14 @@ TEXT: `Actually my favorite beer is IPA, not Guinness. I live in El Cerrito.`
   {"subject": "rick", "predicate": "location", "value": "El Cerrito", "layer": "profile",
    "is_belief": false, "confidence": 0.85, "valid_from": null, "valid_to": null,
    "action": "assert", "contradicts": [], "evidence": "I live in El Cerrito"}
- ]}
+ ],
+ "edges": [], "aliases": []}
 ```
+
+Edge/alias example — TEXT: `johnny (the inference manager, now renamed nova) runs on specul8-o-matic.`
+→ facts `[{"subject": "nova", "predicate": "runs_on", "value": "specul8-o-matic", ...}]`,
+`"edges": [{"src": "nova", "relation": "runs_on", "dst": "specul8-o-matic", "confidence": 0.85,
+"evidence": "runs on specul8-o-matic"}]`, `"aliases": [{"alias": "johnny", "canonical": "nova",
+"evidence": "now renamed nova"}]`.
 
 Reply with the JSON object only.

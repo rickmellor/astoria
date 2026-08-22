@@ -127,7 +127,8 @@ def build_mcp():
         Either way a tombstone stops the fact being re-learned from old conversations; only an explicit
         `remember` re-asserts it. Prefer `remember(..., retract=true)` when the fact WAS true and just
         stopped being true (keeps history); use forget when it should never have been stored.
-        Returns {forgotten:[{id, subject, predicate, value}]}.
+        Returns {forgotten:[{id, subject, predicate, value}]}. For a vague natural-language request
+        ("forget the beer stuff") prefer memory(action="resolve", text=...) → show targets → resolve_apply.
         """
         p = _clean(dict(fact_id=fact_id, subject=subject, predicate=predicate, value=value, query=query,
                         mode=mode, user_id=user_id))
@@ -139,8 +140,19 @@ def build_mcp():
                as_believed_at: str = "", limit: int = 50, max_tokens: int = 1200, name: str = "",
                cardinality: str = "", layer_hint: str = "", confidence: float | None = None,
                importance: float | None = None, valid_from: str = "", valid_to: str = "",
-               tags: list[str] | None = None, session_id: str = "", kind: str = "") -> dict:
+               tags: list[str] | None = None, session_id: str = "", kind: str = "",
+               text: str = "", confirm: bool = False, plan: dict | None = None, node: str = "",
+               depth: int | None = None, src: str = "", relation: str = "", dst: str = "", edge_id: str = "",
+               alias: str = "", canonical: str = "", evidence: str = "") -> dict:
         """Admin / inspection dispatcher over the memory store. Set `action` and pass only what it needs:
+          resolve     text — NATURAL-LANGUAGE memory instruction ("forget the beer stuff", "actually I
+                      moved to Oakland", "I don't use Emacs anymore") → an LLM resolves WHICH facts are
+                      meant and returns a plan {intent: forget|retract|correct|remember|none, targets:[facts],
+                      new_fact, confidence, explanation, requires_confirmation}. NOTHING is applied — show
+                      the user the targets when requires_confirmation is true, then call resolve_apply.
+          resolve_apply  plan (from resolve) — apply it; or text [+ confirm=true] — resolve and apply in
+                      one step (applies without confirm only when the plan is unambiguous). Use these
+                      when `forget`/`remember` would need a subject/predicate you don't have.
           list        [subject, predicate, status(active|staging|superseded|retracted|archived|any), layer, q, limit]
                       — browse facts.               get  fact_id — one fact.
           update      fact_id[, value, status, confidence, importance, layer, valid_from, valid_to, tags]
@@ -152,24 +164,39 @@ def build_mcp():
           approve     fact_id — promote a low-confidence `staging` fact to active.
           episodes    [session_id, kind, limit] — list raw episodes.
           audit       [limit] — the mutation log.            health — service/DB/TEI/LLM status.
+        Graph layer (typed links between subjects/entities and facts; nodes are an entity name,
+        "entity:<name>" or "fact:<uuid>"):
+          graph       node[, depth] — the neighbourhood of a node: {root, nodes[{id,kind,hops,via,label}], edges}.
+          edges       [node, relation, depth] — list edges (touching node / within depth hops).
+          edge_add    src, relation, dst[, confidence, evidence] — assert a link ("johnny" runs_on "specul8-o-matic";
+                      relations snake_case: part_of, located_in, works_at, owns, runs_on, depends_on, related_to).
+          edge_delete edge_id — retract an edge.
+          aliases     [canonical] — subject aliases (alias → canonical name).
+          alias_add   alias, canonical — declare two names the same subject (rename / aka); every later write
+                      or read on `alias` lands on `canonical`.          alias_delete alias.
         """
         a = (action or "").strip().lower()
         p = _clean(dict(user_id=user_id, fact_id=fact_id, subject=subject, predicate=predicate, value=value,
                         status=status, layer=layer, q=q, at=at, as_believed_at=as_believed_at, limit=limit,
                         max_tokens=max_tokens, name=name, cardinality=cardinality, layer_hint=layer_hint,
                         confidence=confidence, importance=importance, valid_from=valid_from, valid_to=valid_to,
-                        tags=tags, session_id=session_id, kind=kind))
+                        tags=tags, session_id=session_id, kind=kind, text=text, confirm=confirm, plan=plan,
+                        node=node, depth=depth, src=src, relation=relation, dst=dst, edge_id=edge_id, alias=alias,
+                        canonical=canonical, evidence=evidence))
         table = {"list": "facts_list", "get": "fact_get", "update": "fact_update", "history": "history",
                  "as_of": "as_of", "profile": "profile", "briefing": "briefing", "approve": "approve",
                  "audit": "audit", "health": "health", "episodes": "episodes_list", "facts": "facts_list",
-                 "delete": "fact_delete"}
+                 "delete": "fact_delete", "resolve": "resolve", "resolve_apply": "resolve_apply",
+                 "graph": "graph", "edges": "edges_list", "edge_add": "edge_add", "edge_delete": "edge_delete",
+                 "aliases": "aliases_list", "alias_add": "alias_add", "alias_delete": "alias_delete"}
         if a == "predicates":
             svc = "predicate_update" if (name and (cardinality or layer_hint)) else "predicates_list"
         elif a in table:
             svc = table[a]
         else:
-            return {"error": f"unknown action {action!r}; valid: list|get|update|history|as_of|profile|briefing|"
-                             f"predicates|approve|episodes|audit|health"}
+            return {"error": f"unknown action {action!r}; valid: resolve|resolve_apply|list|get|update|history|"
+                             f"as_of|profile|briefing|predicates|approve|episodes|audit|health|graph|edges|"
+                             f"edge_add|edge_delete|aliases|alias_add|alias_delete"}
         r = do_action(svc, p, _client())
         if isinstance(r, list):
             return {"action": a, "count": len(r), "items": r}

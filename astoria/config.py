@@ -42,9 +42,13 @@ class Settings(BaseSettings):
     # --- rerank (optional cross-encoder stage over the top-N recall candidates) ---
     # priority list "url|model,url|model" of TEI rerankers (POST /rerank); NAS astoria-rerank container
     # (cross-encoder/ms-marco-MiniLM-L-6-v2, 22M params, CPU) is the default. Empty → stage off.
-    rerank_urls: str = "http://192.168.1.134:8935|cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_urls: str = ("http://192.168.1.221:8935|cross-encoder/ms-marco-MiniLM-L-6-v2,"
+                        "http://192.168.1.134:8935|cross-encoder/ms-marco-MiniLM-L-6-v2")  # workstation (fast, nightly-off) → NAS
     rerank_enabled: bool = True                       # kill switch; per-request `rerank=False` also bypasses
-    rerank_top_n: int = 30                            # candidates (facts+episodes, by score) sent to the reranker
+    # top-N fact candidates (by score) sent to the reranker, plus the top-6 episode candidates (recall.py
+    # RERANK_EPISODES). CPU-bound on the NAS (~0.3 ms/token, hooks capped at 240 chars): 30 facts + 6
+    # episodes ≈ 300-350 ms cold; repeated (query, hook) pairs are cached — measured 2026-08-22.
+    rerank_top_n: int = 30
     rerank_weight: float = 0.6                        # final = (1-w)·norm(score) + w·norm(sigmoid(rerank))
     rerank_timeout_s: float = 3.0                     # read path: fail fast, degrade to the base ranking
 

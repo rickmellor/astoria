@@ -264,3 +264,62 @@ def test_real_embedding_if_tei_reachable(uid, monkeypatch):
         assert vec is not None
         vec = vec.to_list() if hasattr(vec, "to_list") else list(vec)
         assert len(vec) == 768
+
+
+# ---------------------------------------------------------------------------
+# async write-path embedding (settings.embed_sync=False default) + backfill
+
+def test_capture_async_embedding_null_then_backfill(uid, monkeypatch):
+    from astoria.config import settings
+    from astoria.curator import maintenance as curator
+
+    def must_not_embed(*a, **k):
+        raise AssertionError("embed_one must not be called on the async write path")
+    monkeypatch.setattr(episodes, "embed_one", must_not_embed)
+    monkeypatch.setattr(facts, "embed_one", must_not_embed)
+    assert settings().embed_sync is False
+    with db.conn() as c:
+        r = cap.capture(c, user_id=uid, kind="note", text="Rick prefers IPAs over lagers, async path.", cognify=False)
+        assert r["dropped"] is None
+        ep = episodes.get_episode(c, user_id=uid, episode_id=r["episode_id"])
+        assert ep["embedding"] is None
+        # detector fact on the same path: also NULL
+        r2 = cap.capture(c, user_id=uid, kind="note", text="/remember me preferred_shell fish", cognify=False)
+        f = facts.get_fact(c, user_id=uid, fact_id=r2["detector"]["fact_id"])
+        assert f["embedding"] is None
+        # recall's BM25 leg still finds the un-embedded episode
+        hit = c.execute("SELECT id FROM episode WHERE user_id=%s AND tsv @@ plainto_tsquery('english', 'IPAs lagers')",
+                        (uid,)).fetchall()
+        assert [str(h["id"]) for h in hit] == [r["episode_id"]]
+        # worker tick: embed_backfill fills both
+        monkeypatch.setattr(curator, "embed_texts", lambda texts, **kw: [[0.2] * 768 for _ in texts])
+        rep = curator.embed_backfill(c, limit=500)
+        assert rep["facts"] >= 1 and rep["episodes"] >= 2
+        assert episodes.get_episode(c, user_id=uid, episode_id=r["episode_id"])["embedding"] is not None
+        assert facts.get_fact(c, user_id=uid, fact_id=r2["detector"]["fact_id"])["embedding"] is not None
+        assert c.execute("SELECT count(*) AS n FROM episode WHERE user_id=%s AND embedding IS NULL", (uid,)).fetchone()["n"] == 0
+
+
+def test_capture_sync_embeds_inline(uid, monkeypatch):
+    from astoria.config import settings
+    calls = {"n": 0}
+
+    def fake(*a, **k):
+        calls["n"] += 1
+        return [0.3] * 768
+    monkeypatch.setattr(episodes, "embed_one", fake)
+    monkeypatch.setattr(facts, "embed_one", fake)
+    with db.conn() as c:
+        r = cap.capture(c, user_id=uid, kind="note", text="sync capture should embed inline", cognify=False, sync=True)
+        assert episodes.get_episode(c, user_id=uid, episode_id=r["episode_id"])["embedding"] is not None
+        assert calls["n"] == 1
+        # settings.embed_sync=True flips the default
+        monkeypatch.setattr(settings(), "embed_sync", True)
+        r2 = cap.capture(c, user_id=uid, kind="note", text="/remember me preferred_shell zsh", cognify=False)
+        assert episodes.get_episode(c, user_id=uid, episode_id=r2["episode_id"])["embedding"] is not None
+        assert facts.get_fact(c, user_id=uid, fact_id=r2["detector"]["fact_id"])["embedding"] is not None
+        assert calls["n"] == 3
+        # explicit sync=False wins over the setting
+        r3 = cap.capture(c, user_id=uid, kind="note", text="explicit async even when the setting says sync", cognify=False, sync=False)
+        assert episodes.get_episode(c, user_id=uid, episode_id=r3["episode_id"])["embedding"] is None
+        assert calls["n"] == 3

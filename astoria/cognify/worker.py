@@ -1,5 +1,10 @@
 """Cognify worker — drains `cognify_queue` in-process and runs the curator timers.
 
+Each tick (settings.cognify_poll_s, 30 s): curator.embed_backfill FIRST (fills the NULL embeddings the async
+write path leaves behind; batched 8 → TEI), then the cognify drain. Curator groups: hourly
+(settings.curator_interval_min: profile re-derive for changed users + working-window turn archive), reflect
+(settings.reflect_interval_h), daily (settings.curator_daily_h: dedup_facts + decay + prune_snapshots).
+
 Single-leader: the loop only drains while it holds `pg_try_advisory_lock(43)` on a dedicated
 connection (CONTRACT §Service). Jobs are claimed with FOR UPDATE SKIP LOCKED, coalesced per
 (user_id, session_id), and each group is extracted+applied+marked-done in ONE transaction — a
@@ -25,15 +30,13 @@ from astoria.store import db
 log = logging.getLogger("astoria.cognify.worker")
 
 ADVISORY_LOCK_ID = 43
-TICK_S = 30.0
+TICK_S = 30.0                 # default only; run_forever reads settings().cognify_poll_s
 BACKOFF_MIN = [1, 5, 15, 60, 240]
 GROUP_MAX_EPISODES = 8
 GROUP_MAX_CHARS = 6000
 BODY_MAX_CHARS = 6000
 STALE_RUNNING_MIN = 30
-EMBED_BACKFILL_S = 15 * 60
-REDERIVE_PROFILE_S = 6 * 3600
-DAILY_S = 24 * 3600
+EMBED_BACKFILL_LIMIT = 200    # rows per tick (facts + episodes), batched 8 → TEI
 
 
 def backoff_minutes(attempts: int) -> int:
@@ -148,7 +151,7 @@ def process_group(group: list[dict]) -> dict:
         with db.conn() as c:
             # non-extract queue kinds are routed to the curator
             if kind == "rederive_profile":
-                res = curator.rederive_profile(c, user_id)
+                res = curator.rederive_profile(c, user_id, llm=bool(settings().profile_llm))
                 _mark_done(c, ids, {"rederive_profile": {"version": res["version"], "changed": res["changed"]}})
                 return {"ids": ids, "state": "done", "result": res}
             if kind == "embed_backfill":
@@ -258,36 +261,104 @@ def _release_leader_lock(conn: psycopg.Connection | None) -> None:
             conn.close()
 
 
+def _schedule_intervals() -> dict[str, float]:
+    """Seconds between runs of each curator group (from Settings)."""
+    st = settings()
+    return {
+        "hourly": max(60.0, float(st.curator_interval_min) * 60.0),   # profile re-derive check + working-window archive
+        "reflect": max(300.0, float(st.reflect_interval_h) * 3600.0),
+        "daily": max(3600.0, float(st.curator_daily_h) * 3600.0),       # dedup + decay + snapshot prune
+    }
+
+
+def embed_backfill_tick() -> dict:
+    """Every tick, BEFORE the cognify drain: fill NULL embeddings left by the async write path."""
+    with db.conn() as c:
+        r = curator.embed_backfill(c, limit=EMBED_BACKFILL_LIMIT)
+    if r.get("facts") or r.get("episodes"):
+        log.info("embed_backfill: facts=%d episodes=%d pending=%d/%d", r["facts"], r["episodes"],
+                 r["pending_facts"], r["pending_episodes"])
+    return r
+
+
 def _curator_tick(due: dict) -> None:
-    """Run whichever curator jobs are due (sync; called via to_thread)."""
-    if due.get("embed"):
-        with db.conn() as c:
-            r = curator.embed_backfill(c)
-        log.info("embed_backfill: %s", r)
-    if due.get("profile"):
+    """Run whichever curator groups are due (sync; called via to_thread). One log line per pass."""
+    st = settings()
+    if due.get("hourly"):
         with db.conn() as c:
             users = curator.users_with_profile_changes(c)
         for u in users:
             try:
                 with db.conn() as c:
-                    r = curator.rederive_profile(c, u)
-                log.info("rederive_profile %s: v%s changed=%s", u, r["version"], r["changed"])
+                    r = curator.rederive_profile(c, u, llm=bool(st.profile_llm))
+                log.info("rederive_profile %s: v%s changed=%s source=%s facts=%d",
+                         u, r["version"], r["changed"], r.get("source"), r.get("facts", 0))
             except Exception:
                 log.exception("rederive_profile failed for %s", u)
+        try:
+            with db.conn() as c:
+                n = curator.archive_old_turns(c)
+            if n:
+                log.info("archive_old_turns: archived %d turns (window %dh / %d per session)",
+                         n, st.working_window_hours, st.working_window_turns)
+        except Exception:
+            log.exception("archive_old_turns failed")
+    if due.get("reflect"):
+        try:
+            with db.conn() as c:
+                users = curator.users_with_unreflected(c)
+        except Exception:
+            log.exception("reflect: user scan failed")
+            users = []
+        for u in users:
+            try:
+                with db.conn() as c:
+                    r = curator.reflect(c, u)
+                log.info("reflect %s: episodes=%d insights=%d written=%d%s", u, r["episodes"], r["insights"],
+                         sum(1 for w in r["written"] if w.get("action") not in (None, "error")),
+                         f" error={r['error']}" if r.get("error") else "")
+            except Exception:
+                log.exception("reflect failed for %s", u)
     if due.get("daily"):
-        with db.conn() as c:
-            n1 = curator.prune_snapshots(c)
-            n2 = curator.archive_old_turns(c)
-        log.info("daily curator: pruned %d snapshots, archived %d turns", n1, n2)
+        try:
+            with db.conn() as c:
+                users = curator.users_with_facts(c)
+        except Exception:
+            log.exception("daily curator: user scan failed")
+            users = []
+        for u in users:
+            try:
+                with db.conn() as c:
+                    r = curator.dedup_facts(c, u)
+                log.info("dedup_facts %s: candidates=%d merged=%d skipped=%d", u, r["candidates"], r["merged"], r["skipped"])
+            except Exception:
+                log.exception("dedup_facts failed for %s", u)
+            try:
+                with db.conn() as c:
+                    r = curator.decay(c, u)
+                log.info("decay %s: candidates=%d archived=%d kept=%d threshold=%.3f",
+                         u, r["candidates"], r["archived"], r["kept"], r["threshold"])
+            except Exception:
+                log.exception("decay failed for %s", u)
+        try:
+            with db.conn() as c:
+                n1 = curator.prune_snapshots(c)
+            log.info("prune_snapshots: pruned %d", n1)
+        except Exception:
+            log.exception("prune_snapshots failed")
 
 
-async def run_forever(stop: asyncio.Event, tick_s: float = TICK_S) -> None:
-    """Leader-elected loop: drain every `tick_s`; embed backfill 15 min; profile re-derive 6 h; daily prune/archive.
-    Immediate drain on start. Never raises."""
+async def run_forever(stop: asyncio.Event, tick_s: float | None = None) -> None:
+    """Leader-elected loop. Every tick (settings.cognify_poll_s): embed_backfill, then drain cognify.
+    Curator groups: hourly (profile re-derive + working-window archive; settings.curator_interval_min),
+    reflect (settings.reflect_interval_h), daily (dedup + decay + snapshot prune; settings.curator_daily_h).
+    Immediate run on start. Never raises."""
+    tick_s = float(tick_s if tick_s is not None else (settings().cognify_poll_s or TICK_S))
     lock_conn: psycopg.Connection | None = None
-    last = {"embed": 0.0, "profile": 0.0, "daily": 0.0}
-    interval = {"embed": EMBED_BACKFILL_S, "profile": REDERIVE_PROFILE_S, "daily": DAILY_S}
-    log.info("cognify worker loop starting (tick %.0fs)", tick_s)
+    interval = _schedule_intervals()
+    last = {k: 0.0 for k in interval}
+    log.info("cognify worker loop starting (tick %.0fs; curator hourly=%.0fs reflect=%.0fs daily=%.0fs)",
+             tick_s, interval["hourly"], interval["reflect"], interval["daily"])
     try:
         while not stop.is_set():
             try:
@@ -296,6 +367,10 @@ async def run_forever(stop: asyncio.Event, tick_s: float = TICK_S) -> None:
                     if lock_conn is not None:
                         log.info("worker: acquired leader lock %d", ADVISORY_LOCK_ID)
                 if lock_conn is not None:
+                    try:
+                        await asyncio.to_thread(embed_backfill_tick)
+                    except Exception:
+                        log.exception("embed_backfill tick failed")
                     r = await asyncio.to_thread(drain_once)
                     if r.get("processed") or r.get("failed") or r.get("dead"):
                         log.info("drain: %s", r)

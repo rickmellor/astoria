@@ -61,7 +61,7 @@ def _recall(uid, query, **kw):
 
 def test_beer_returns_ipa_first_not_guinness(uid):
     res = _recall(uid, "what beer do I like")
-    assert res["health"] == {"tei": "ok", "degraded": False}
+    assert {k: res["health"][k] for k in ("tei", "degraded")} == {"tei": "ok", "degraded": False}
     assert res["items"], res
     top = res["items"][0]
     assert top["kind"] == "fact" and top["predicate"] == "favorite_beer" and top["value"] == "IPA"
@@ -138,7 +138,7 @@ def test_snapshot_and_touch(uid):
 def test_degraded_bm25_only(uid, monkeypatch):
     monkeypatch.setattr(R, "embed_one", lambda *a, **k: None)
     res = _recall(uid, "favorite beer")
-    assert res["health"] == {"tei": "down", "degraded": True}
+    assert {k: res["health"][k] for k in ("tei", "degraded")} == {"tei": "down", "degraded": True}
     assert res["items"] and res["items"][0]["value"] == "IPA"
 
 

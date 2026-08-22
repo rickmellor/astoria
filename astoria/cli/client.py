@@ -196,6 +196,21 @@ class AstoriaClient:
             body["query"] = query
         return self.post("/forget", body)
 
+    def resolve(self, text: str, *, limit: int | None = None) -> dict:
+        body: dict[str, Any] = {"user_id": self.user, "text": text}
+        if limit:
+            body["limit"] = limit
+        return self.post("/resolve", body)
+
+    def resolve_apply(self, *, plan: dict | None = None, text: str | None = None,
+                      confirm: bool = False) -> dict:
+        body: dict[str, Any] = {"user_id": self.user, "confirm": confirm}
+        if plan is not None:
+            body["plan"] = plan
+        if text:
+            body["text"] = text
+        return self.post("/resolve/apply", body)
+
     def approve(self, fact_id: str) -> dict:
         return self.post("/approve", {"user_id": self.user, "fact_id": fact_id})
 
@@ -229,6 +244,32 @@ class AstoriaClient:
 
     def audit(self, limit: int | None = None) -> list[dict]:
         return self.get("/audit", user_id=self.user, limit=limit) or []
+
+    # graph layer + aliases
+    def graph(self, node: str, *, depth: int | None = None, fanout: int | None = None) -> dict:
+        return self.get("/graph", user_id=self.user, node=node, depth=depth, fanout=fanout)
+
+    def list_edges(self, *, node: str | None = None, relation: str | None = None, depth: int | None = None,
+                   status: str | None = None, limit: int | None = None) -> list[dict]:
+        return self.get("/edges", user_id=self.user, node=node, relation=relation, depth=depth,
+                        status=status, limit=limit) or []
+
+    def add_edge(self, src: str, relation: str, dst: str, **extra: Any) -> dict:
+        body = {"user_id": self.user, "src": src, "relation": relation, "dst": dst}
+        body.update({k: v for k, v in extra.items() if v is not None})
+        return self.post("/edges", body)
+
+    def delete_edge(self, edge_id: str, mode: str = "retract") -> dict:
+        return self.delete(f"/edges/{edge_id}", user_id=self.user, mode=mode)
+
+    def list_aliases(self, *, canonical: str | None = None) -> list[dict]:
+        return self.get("/aliases", user_id=self.user, canonical=canonical) or []
+
+    def add_alias(self, alias: str, canonical: str) -> dict:
+        return self.post("/aliases", {"user_id": self.user, "alias": alias, "canonical": canonical})
+
+    def delete_alias(self, alias: str) -> dict:
+        return self.delete(f"/aliases/{alias}", user_id=self.user)
 
     def op(self, action: str, **fields: Any) -> Any:
         return self.post("/op", {"action": action, "user_id": self.user, **fields})

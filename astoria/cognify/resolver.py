@@ -27,8 +27,10 @@ from astoria.config import settings
 from astoria.core import llm
 from astoria.core.embed import embed_one, embed_texts
 from astoria.store import facts
+from astoria.store import graph as gstore
 
 log = logging.getLogger("astoria.cognify.resolver")
+_FACT_REF = re.compile(r"^fact[:#\s]*(\d+)$", re.I)
 
 CONF_MIN, CONF_MAX = 0.3, 0.85
 NEAR_DUP_COSINE = 0.93
@@ -100,12 +102,52 @@ class ExtractedFact(BaseModel):
         return str(v)
 
 
+class ExtractedEdge(BaseModel):
+    """Optional graph edge: src/dst are subject names or "fact:<n>" (1-based index into `facts`)."""
+    model_config = ConfigDict(extra="ignore")
+
+    src: str = Field(min_length=1)
+    relation: str = Field(min_length=1)
+    dst: str = Field(min_length=1)
+    confidence: float = 0.6
+    evidence: str | None = None
+
+    @field_validator("src", "relation", "dst", "evidence", mode="before")
+    @classmethod
+    def _str(cls, v):
+        return None if v is None else str(v).strip()
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _conf(cls, v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.6
+
+
+class ExtractedAlias(BaseModel):
+    """Optional subject alias (rename / aka): `alias` is another name for `canonical`."""
+    model_config = ConfigDict(extra="ignore")
+
+    alias: str = Field(min_length=1)
+    canonical: str = Field(min_length=1)
+    evidence: str | None = None
+
+    @field_validator("alias", "canonical", "evidence", mode="before")
+    @classmethod
+    def _str(cls, v):
+        return None if v is None else str(v).strip()
+
+
 class Extraction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     summary: str | None = None
     nothing_durable: bool = False
     facts: list[ExtractedFact] = Field(default_factory=list)
+    edges: list[ExtractedEdge] = Field(default_factory=list)
+    aliases: list[ExtractedAlias] = Field(default_factory=list)
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -115,10 +157,15 @@ class Extraction(BaseModel):
         s = str(v).strip()
         return s or None
 
-    @field_validator("facts", mode="before")
+    @field_validator("facts", "edges", "aliases", mode="before")
     @classmethod
-    def _facts(cls, v):
-        return [] if v is None else v
+    def _lists(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, dict):
+            return [v]
+        # drop malformed items (a bad edge must not sink the whole extraction)
+        return [x for x in v if isinstance(x, (dict, BaseModel))]
 
 
 # ---------------------------------------------------------------------------
@@ -294,14 +341,33 @@ def _near_duplicate_value(c: psycopg.Connection, *, user_id: str, subject: str, 
 def apply(c: psycopg.Connection, *, user_id: str, episode_ids: list, parsed: Extraction, source: str,
           session_id: str | None, occurred_at: datetime | None = None) -> dict:
     """Write a validated Extraction (inside the caller's txn). Returns
-    {"facts": [{id, action, subject, predicate, value}], "retracted": [...], "summary_episode": id|None}."""
+    {"facts": [{id, action, subject, predicate, value}], "retracted": [...], "summary_episode": id|None,
+     "edges": [{id, action, src, relation, dst}], "aliases": [{alias, canonical, action}]}."""
     occ = occurred_at or facts.now_utc()
     ep_ids = [str(e) for e in (episode_ids or [])]
     origin = ep_ids[-1] if ep_ids else None
     out_facts: list[dict] = []
     retracted: list[dict] = []
+    out_edges: list[dict] = []
+    out_aliases: list[dict] = []
 
+    # aliases FIRST so a rename stated in this text canonicalizes the facts/edges that follow
+    for al in getattr(parsed, "aliases", None) or []:
+        try:
+            a = facts.canon_subject(al.alias, user_id)
+            canon = facts.canon_subject(al.canonical, user_id)
+            if a == user_id or a == canon:      # never re-point the user; no self alias
+                continue
+            res = gstore.add_alias(c, user_id=user_id, alias=a, canonical=canon, source=source,
+                                   source_kind="extracted", actor=source)
+            out_aliases.append({"alias": res["alias"]["alias"], "canonical": res["alias"]["canonical"],
+                                "action": res["action"]})
+        except (ValueError, LookupError) as e:
+            log.warning("skip alias %r→%r: %s", al.alias, al.canonical, e)
+
+    pos_ids: list[str | None] = []          # parsed.facts[i] → written fact id (None: retract/skip); for fact:<n> edge refs
     for f in parsed.facts or []:
+        pos_ids.append(None)
         subject = facts.canon_subject(f.subject, user_id)
         predicate = facts.canon_predicate(f.predicate)
         value = re.sub(r"\s+", " ", (f.value or "").strip())
@@ -335,11 +401,38 @@ def apply(c: psycopg.Connection, *, user_id: str, episode_ids: list, parsed: Ext
                 actor=source, contradicts=_valid_uuids(f.contradicts),
                 meta={"cognify": {"episodes": ep_ids, "session_id": session_id}})
             row = res.get("fact")
+            if row is not None:
+                pos_ids[-1] = str(row["id"])
             out_facts.append({"id": str(row["id"]) if row else None, "action": res["action"],
                               "subject": subject, "predicate": predicate, "value": value,
                               "superseded": res.get("superseded", [])})
         except ValueError as e:  # empty value etc. — skip the one fact, keep the job
             log.warning("skip fact %s/%s/%r: %s", subject, predicate, value, e)
+
+    # graph edges: endpoints are subject names (→ entity nodes) or fact:<n> refs into `facts` (1-based)
+    def _node(ref: str) -> str | None:
+        m = _FACT_REF.match(ref or "")
+        if m:
+            i = int(m.group(1)) - 1
+            if 0 <= i < len(pos_ids) and pos_ids[i]:
+                return f"fact:{pos_ids[i]}"
+            return None
+        return f"entity:{facts.canon_subject(ref, user_id)}"
+
+    for e in getattr(parsed, "edges", None) or []:
+        src, dst = _node(e.src), _node(e.dst)
+        if not src or not dst or src == dst:
+            continue
+        try:
+            res = gstore.add_edge(c, user_id=user_id, src=src, relation=e.relation, dst=dst, source=source,
+                                  source_kind="extracted", confidence=_clamp_conf(e.confidence), asserted_at=occ,
+                                  origin_episode=origin, evidence=(e.evidence or None) and e.evidence[:500],
+                                  actor=source, meta={"cognify": {"episodes": ep_ids, "session_id": session_id}})
+            row = res["edge"]
+            out_edges.append({"id": str(row["id"]), "action": res["action"], "src": gstore.node_ref(row["src_kind"], row["src_id"]),
+                              "relation": row["relation"], "dst": gstore.node_ref(row["dst_kind"], row["dst_id"])})
+        except (ValueError, LookupError) as ex:
+            log.warning("skip edge %r -%r-> %r: %s", e.src, e.relation, e.dst, ex)
 
     summary_id = None
     if ep_ids:
@@ -363,4 +456,5 @@ def apply(c: psycopg.Connection, *, user_id: str, episode_ids: list, parsed: Ext
                       (TURN_IMPORTANCE_AFTER_SUMMARY, turn_ids, TURN_IMPORTANCE_AFTER_SUMMARY))
         c.execute("UPDATE episode SET processed_at=now() WHERE id = ANY(%s::uuid[])", (ep_ids,))
 
-    return {"facts": out_facts, "retracted": retracted, "summary_episode": summary_id}
+    return {"facts": out_facts, "retracted": retracted, "summary_episode": summary_id,
+            "edges": out_edges, "aliases": out_aliases}

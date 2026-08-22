@@ -150,7 +150,7 @@ def test_apply_nothing_durable_marks_processed(user):
         ep = add_turn(c, user, "User: ok\nAssistant: sure")
         res = resolver.apply(c, user_id=user, episode_ids=[ep], parsed=Extraction(nothing_durable=True),
                              source="input", session_id="s1")
-        assert res == {"facts": [], "retracted": [], "summary_episode": None}
+        assert res == {"facts": [], "retracted": [], "summary_episode": None, "edges": [], "aliases": []}
         row = c.execute("SELECT processed_at FROM episode WHERE id=%s", (ep,)).fetchone()
         assert row["processed_at"] is not None
         assert c.execute("SELECT count(*) AS n FROM episode WHERE user_id=%s AND kind='summary'", (user,)).fetchone()["n"] == 0

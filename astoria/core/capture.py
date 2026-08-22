@@ -16,6 +16,7 @@ from datetime import datetime
 
 import psycopg
 
+from astoria.config import settings
 from astoria.store import episodes, facts
 
 log = logging.getLogger("astoria.capture")
@@ -114,7 +115,7 @@ def detect(text: str | None, user_id: str) -> dict | None:
 
 
 def _apply_detector(c: psycopg.Connection, det: dict, *, user_id: str, source: str, actor: str | None,
-                    episode_id: str | None, evidence: str | None) -> dict:
+                    episode_id: str | None, evidence: str | None, embed: bool = True) -> dict:
     out = {k: det.get(k) for k in ("op", "subject", "predicate", "value")}
     out.update(fact_id=None, action=None)
     try:
@@ -137,7 +138,7 @@ def _apply_detector(c: psycopg.Connection, det: dict, *, user_id: str, source: s
                     c, user_id=user_id, subject=det["subject"], predicate=det["predicate"], value=det["value"],
                     source=source, source_kind="detector", confidence=facts.KIND_CONF["detector"],
                     origin_episode=episode_id, evidence=(evidence or "")[:500] or None,
-                    cardinality=det.get("cardinality"), actor=actor)
+                    cardinality=det.get("cardinality"), actor=actor, embed=embed)
                 out["fact_id"] = str(res["fact"]["id"]) if res.get("fact") else None
                 out["action"] = res["action"]
                 out["superseded"] = res.get("superseded", [])
@@ -152,11 +153,16 @@ def capture(c: psycopg.Connection, *, user_id: str, kind: str = "turn", text: st
             user_input: str | None = None, agent_response: str | None = None, source: str = "api",
             session_id: str | None = None, occurred_at: datetime | None = None, importance: float = 0.5,
             tags: Iterable[str] = (), meta: dict | None = None, cognify: bool = True,
-            priority: str = "normal", actor: str | None = None) -> dict:
+            priority: str = "normal", actor: str | None = None, sync: bool | None = None) -> dict:
     """Gate → episode (idempotent) → detector → cognify queue. Call inside `db.conn()`.
+
+    `sync` — embed inline (one TEI call in the request). Default = settings().embed_sync (False): the
+    episode (and any detector fact) is written with `embedding NULL` and the worker's embed_backfill
+    fills it on its next tick; BM25 recall works meanwhile.
 
     Returns {"episode_id", "deduped", "dropped", "detector", "queued"}.
     """
+    embed = bool(sync) if sync is not None else bool(settings().embed_sync)
     user_text = user_input if (kind == "turn" and user_input is not None) else (text if text is not None else user_input)
     det = detect(user_text, user_id)
     # detector-matched slash commands (/remember, /correct, /forget) are memory ops, not noise — keep them
@@ -167,14 +173,14 @@ def capture(c: psycopg.Connection, *, user_id: str, kind: str = "turn", text: st
     ep = episodes.add_episode(
         c, user_id=user_id, kind=kind, text=text, user_input=user_input, agent_response=agent_response,
         source=source, session_id=session_id, occurred_at=occurred_at, importance=importance, tags=tags,
-        meta=meta, embed=True)
+        meta=meta, embed=embed)
     row, deduped = ep["episode"], ep["deduped"]
     episode_id = str(row["id"])
 
     detector = None
     if det:
         detector = _apply_detector(c, det, user_id=user_id, source=source, actor=actor,
-                                   episode_id=episode_id, evidence=user_text)
+                                   episode_id=episode_id, evidence=user_text, embed=embed)
 
     queued = False
     if cognify and not deduped:

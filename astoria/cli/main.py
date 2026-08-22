@@ -45,11 +45,15 @@ Astoria service over HTTP (it never touches the database).
   [cyan]astoria remember rick favorite_beer IPA[/cyan]           → assert a fact (supersedes the old value)
   [cyan]astoria remember --text "Prefers dark mode"[/cyan]       → capture a note; the worker extracts facts
   [cyan]astoria correct rick favorite_beer Stout[/cyan]          → same as remember, shows what it replaced
+  [cyan]astoria resolve "forget the beer stuff"[/cyan]            → LLM resolves WHICH facts are meant (preview only)
+  [cyan]astoria forget "the thing about Guinness"[/cyan]         → resolve → show targets → confirm → apply
   [cyan]astoria facts -q beer[/cyan] · [cyan]astoria fact 3f2a[/cyan]        → browse, then inspect provenance
   [cyan]astoria history rick favorite_beer[/cyan]                → supersede chain as a timeline
   [cyan]astoria as-of 2026-01-01[/cyan]                          → what was true back then
   [cyan]astoria staging[/cyan] → [cyan]astoria approve ID[/cyan]               → review extracted facts
   [cyan]astoria briefing[/cyan] · [cyan]astoria profile[/cyan]                  → stable prompt prefix / who the user is
+  [cyan]astoria graph johnny[/cyan] · [cyan]astoria edge add A runs_on B[/cyan]   → walk / extend the entity graph
+  [cyan]astoria alias add specul8 specul8-o-matic[/cyan]       → two names, one subject
 
 [bold]Environment[/bold]
   ASTORIA_URL    service base URL   (default http://192.168.1.134:8933)
@@ -77,6 +81,14 @@ predicate_app = typer.Typer(help="Operate on a single predicate ([cyan]set[/cyan
                             rich_markup_mode="rich", no_args_is_help=True)
 app.add_typer(episode_app, name="episode", rich_help_panel="Episodes & capture")
 app.add_typer(predicate_app, name="predicate", rich_help_panel="Admin")
+edge_app = typer.Typer(help="Operate on a single edge ([cyan]add[/cyan] / [cyan]rm[/cyan]). "
+                            "Use [cyan]astoria edges[/cyan] to list, [cyan]astoria graph NODE[/cyan] to walk.",
+                       rich_markup_mode="rich", no_args_is_help=True)
+alias_app = typer.Typer(help="Subject aliases: [cyan]add ALIAS CANONICAL[/cyan] · [cyan]list[/cyan] · [cyan]rm ALIAS[/cyan]. "
+                             "Writes and reads on ALIAS land on CANONICAL.",
+                        rich_markup_mode="rich", no_args_is_help=True)
+app.add_typer(edge_app, name="edge", rich_help_panel="Graph & aliases")
+app.add_typer(alias_app, name="alias", rich_help_panel="Graph & aliases")
 
 P_READ = "Read memory"
 P_WRITE = "Write memory"
@@ -84,6 +96,7 @@ P_FACTS = "Facts & time travel"
 P_EPI = "Episodes & capture"
 P_ADMIN = "Admin"
 P_DATA = "Data"
+P_GRAPH = "Graph & aliases"
 
 
 @dataclass
@@ -431,18 +444,155 @@ def remember(
     _print_upsert(ctx, res, "remembered")
 
 
+# ---- LLM target resolver (natural-language forget / correct / retract) --------------------
+INTENT_STYLE = {"forget": "red", "retract": "yellow", "correct": "cyan", "remember": "green", "none": "dim"}
+
+
+def _looks_like_free_text(arg: str | None, predicate: str | None) -> bool:
+    """A single argument with no predicate that isn't a (short) fact id → natural-language instruction."""
+    if not arg or predicate:
+        return False
+    a = arg.strip()
+    if re.fullmatch(r"[0-9a-fA-F-]{8,36}", a):
+        return False
+    return True
+
+
+def _print_plan(ctx: typer.Context, plan: dict) -> None:
+    if _ctx(ctx).json:
+        R.print_json(plan)
+        return
+    intent = str(plan.get("intent") or "none")
+    style = INTENT_STYLE.get(intent, "")
+    conf = plan.get("confidence")
+    R.console.print(f"[bold]intent[/bold] [{style}]{escape(intent)}[/{style}]  "
+                    f"[dim]confidence {R.fmt_num(conf)} · {plan.get('candidates', 0)} candidate(s) considered[/dim]")
+    if plan.get("explanation"):
+        R.console.print(f"  {escape(str(plan['explanation']))}")
+    if plan.get("error"):
+        R.warn(str(plan["error"]))
+    targets = plan.get("targets") or []
+    if targets:
+        R.console.print(R.facts_table(targets, title=f"targets ({intent})"))
+        for t in targets:
+            if t.get("reason"):
+                R.console.print(f"  [dim]{R.short_id(t.get('id'))}: {escape(str(t['reason']))}[/dim]")
+    elif intent in ("forget", "retract", "correct"):
+        R.info("  (no stored fact matched as a target)")
+    nf = plan.get("new_fact")
+    if nf:
+        vf = f" [dim]from {nf.get('valid_from')}[/dim]" if nf.get("valid_from") else ""
+        R.console.print(f"  [bold]new fact[/bold] [bold]{escape(str(nf.get('subject')))}[/bold] "
+                        f"[cyan]{escape(str(nf.get('predicate')))}[/cyan] {escape(str(nf.get('value')))}{vf}")
+    if intent != "none":
+        R.console.print("  [dim]" + ("confirmation required" if plan.get("requires_confirmation")
+                                      else "unambiguous — would apply without confirmation") + "[/dim]")
+
+
+def _print_applied(ctx: typer.Context, res: dict) -> None:
+    if _ctx(ctx).json:
+        R.print_json(res)
+        return
+    if not res.get("applied"):
+        R.warn(f"nothing applied ({res.get('reason') or res.get('action') or 'no change'})")
+        return
+    intent = res.get("intent")
+    changed = res.get("changed") or []
+    if intent in ("forget", "retract"):
+        verb = "forgot" if intent == "forget" else "retracted"
+        ids = [R.short_id((ch.get("fact") or {}).get("id")) for ch in changed]
+        R.ok(f"{verb} {len(ids)} fact(s): " + ", ".join(ids))
+    else:
+        f = res.get("fact")
+        R.ok(f"{'corrected' if intent == 'correct' else 'remembered'} [{res.get('action') or 'ok'}] "
+             + (_fact_line(f) if f else ""))
+        c = _ctx(ctx).client
+        for sid in res.get("superseded") or []:
+            try:
+                R.console.print(f"  [dim]superseded →[/dim] {_fact_line(c.get_fact(str(sid)))}")
+            except ApiError:
+                R.console.print(f"  [dim]superseded → {sid}[/dim]")
+
+
+def _resolve_flow(ctx: typer.Context, text: str, *, expect: str | None, yes: bool,
+                  plan: dict | None = None) -> None:
+    """resolve → preview → confirm → apply. `expect` = the sub-command's intent (forget/correct/retract);
+    a different resolved intent is shown and needs an explicit confirmation (refused under --yes).
+    `plan` = an already-fetched plan (skips the resolve call)."""
+    c = _ctx(ctx).client
+    if plan is None:
+        plan = _run(ctx, c.resolve, text)
+    _print_plan(ctx, plan)
+    intent = str(plan.get("intent") or "none")
+    if intent == "none" or plan.get("error"):
+        if not _ctx(ctx).json:
+            R.warn("no memory operation to apply")
+        raise typer.Exit(code=1)
+    if intent in ("forget", "retract", "correct") and not (plan.get("targets") or []) and intent != "correct":
+        if not _ctx(ctx).json:
+            R.warn("nothing to apply — no matching fact")
+        raise typer.Exit(code=1)
+    mismatch = expect is not None and intent != expect
+    if yes:
+        if mismatch:
+            R.warn(f"resolver read this as '{intent}', not '{expect}' — re-run without --yes to confirm, "
+                   f"or use `astoria {intent if intent != 'remember' else 'remember'} ...`")
+            raise typer.Exit(code=1)
+    else:
+        what = {"forget": "soft-forget the target(s)", "retract": "retract the target(s)",
+                "correct": "apply the correction", "remember": "remember the new fact"}[intent]
+        prefix = f"(resolved as '{intent}', not '{expect}') " if mismatch else ""
+        if not typer.confirm(f"{prefix}{what}?", default=False):
+            raise typer.Exit(code=1)
+    res = _run(ctx, c.resolve_apply, plan=plan, confirm=True)
+    _print_applied(ctx, res)
+
+
+@app.command(rich_help_panel=P_WRITE)
+def resolve(
+    ctx: typer.Context,
+    text: str = typer.Argument(..., help="Natural-language memory instruction."),
+    apply: bool = typer.Option(False, "--apply", help="Apply the plan (asks first unless --yes)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="With --apply: skip the confirmation prompt."),
+):
+    """Preview how the LLM target-resolver reads a natural-language instruction: which stored facts it
+    means and what it would do (forget / retract / correct / remember). Nothing is applied unless
+    [cyan]--apply[/cyan].
+
+    [dim]Examples:[/dim]
+      [cyan]astoria resolve "forget the beer stuff"[/cyan]
+      [cyan]astoria resolve "actually I moved to Oakland" --apply[/cyan]
+    """
+    if apply:
+        _resolve_flow(ctx, text, expect=None, yes=yes)
+        return
+    plan = _run(ctx, _ctx(ctx).client.resolve, text)
+    _print_plan(ctx, plan)
+
+
 @app.command(rich_help_panel=P_WRITE)
 def correct(
     ctx: typer.Context,
-    subject: str = typer.Argument(..., help="Subject."),
-    predicate: str = typer.Argument(..., help="Predicate."),
-    value: str = typer.Argument(..., help="The new, correct value."),
+    subject: str = typer.Argument(..., help="Subject — or a free-text correction "
+                                            "(\"actually I live in Oakland\") when no PREDICATE follows."),
+    predicate: Optional[str] = typer.Argument(None, help="Predicate."),
+    value: Optional[str] = typer.Argument(None, help="The new, correct value."),
     valid_from: Optional[str] = typer.Option(None, "--from", help="When the new value became true."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="(free-text mode) skip the confirmation prompt."),
 ):
     """Correct a fact — same as [cyan]remember[/cyan] (POST /correct) but prints what it superseded.
+    Given ONE free-text argument instead of a triple, the LLM resolver finds the fact to replace:
+    preview → confirm → apply.
 
-    [dim]Example:[/dim]  [cyan]astoria correct rick favorite_beer Stout[/cyan]
+    [dim]Examples:[/dim]
+      [cyan]astoria correct rick favorite_beer Stout[/cyan]
+      [cyan]astoria correct "actually I live in Oakland"[/cyan]
     """
+    if _looks_like_free_text(subject, predicate) and value is None:
+        _resolve_flow(ctx, subject, expect="correct", yes=yes)
+        return
+    if not (predicate and value):
+        raise typer.BadParameter("need SUBJECT PREDICATE VALUE (or one free-text \"...\" argument)")
     res = _remember_impl(ctx, subject, predicate, value, valid_from=valid_from, valid_to=None,
                          functional=None, layer=None, confidence=None, tags=None,
                          historical=False, endpoint="correct")
@@ -454,18 +604,22 @@ def correct(
 @app.command(rich_help_panel=P_WRITE)
 def retract(
     ctx: typer.Context,
-    subject: Optional[str] = typer.Argument(None, help="Subject."),
+    subject: Optional[str] = typer.Argument(None, help="Subject — or a free-text statement "
+                                                       "(\"I don't use Emacs anymore\") when no PREDICATE follows."),
     predicate: Optional[str] = typer.Argument(None, help="Predicate."),
     value: Optional[str] = typer.Argument(None, help="Value (omit to retract every value of the key)."),
     fact_id: Optional[str] = typer.Option(None, "--id", help="Retract by fact id instead."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="(free-text mode) skip the confirmation prompt."),
 ):
     """Retract a fact: it stops being true [italic]now[/italic] (status → retracted, history kept,
-    tombstoned so extraction can't resurrect it).
+    tombstoned so extraction can't resurrect it). One free-text argument → the LLM resolver picks
+    the fact(s): preview → confirm → apply.
 
     [dim]Examples:[/dim]
       [cyan]astoria retract rick favorite_beer[/cyan]         (all values of the key)
       [cyan]astoria retract rick uses_tool Emacs[/cyan]       (one value)
       [cyan]astoria retract --id 3f2a9c1e[/cyan]
+      [cyan]astoria retract "I don't use Emacs anymore"[/cyan]
     """
     c = _ctx(ctx).client
     if fact_id:
@@ -473,8 +627,11 @@ def retract(
         res = _run(ctx, c.retract, fact_id=fid)
     elif subject and predicate:
         res = _run(ctx, c.retract, subject=subject, predicate=predicate, value=value)
+    elif _looks_like_free_text(subject, predicate):
+        _resolve_flow(ctx, subject, expect="retract", yes=yes)
+        return
     else:
-        raise typer.BadParameter("need SUBJECT PREDICATE [VALUE] or --id ID")
+        raise typer.BadParameter("need SUBJECT PREDICATE [VALUE], --id ID, or one free-text \"...\" argument")
     if _ctx(ctx).json:
         R.print_json(res)
         return
@@ -488,21 +645,28 @@ def retract(
 @app.command(rich_help_panel=P_WRITE)
 def forget(
     ctx: typer.Context,
-    query: Optional[str] = typer.Argument(None, help="Search text; matching facts are listed first."),
+    query: Optional[str] = typer.Argument(None, help="Natural-language instruction (LLM-resolved) — "
+                                                     "or, with --match, literal search text."),
     fact_id: Optional[str] = typer.Option(None, "--id", help="Forget exactly this fact id."),
     hard: bool = typer.Option(False, "--hard",
                               help="Hard delete (row removed). Default is soft (status=deleted, "
                                    "recoverable, tombstoned)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
-    limit: int = typer.Option(25, "--limit", help="(query mode) max matches to show/forget."),
+    match: bool = typer.Option(False, "--match", "-m",
+                               help="Literal mode: substring-match QUERY against fact hooks "
+                                    "(no LLM); lists the matches and asks before acting."),
+    limit: int = typer.Option(25, "--limit", help="(--match mode) max matches to show/forget."),
 ):
     """Forget facts — stronger than retract: they vanish from history too (soft = hidden,
-    --hard = gone). Query mode shows the matches and asks before acting.
+    --hard = gone). A free-text QUERY goes through the LLM target-resolver: it shows WHICH facts it
+    thinks you mean, asks, then soft-forgets them ([cyan]--match[/cyan] = plain substring search instead;
+    [cyan]--hard[/cyan] implies --match or --id).
 
     [dim]Examples:[/dim]
       [cyan]astoria forget --id 3f2a9c1e[/cyan]
-      [cyan]astoria forget "old address" [/cyan]          (preview → confirm)
-      [cyan]astoria forget "old address" --hard --yes[/cyan]
+      [cyan]astoria forget "the thing about Guinness"[/cyan]   (resolve → preview → confirm)
+      [cyan]astoria forget "old address" --match[/cyan]        (substring preview → confirm)
+      [cyan]astoria forget "old address" --match --hard --yes[/cyan]
     """
     c = _ctx(ctx).client
     mode = "hard" if hard else "soft"
@@ -521,6 +685,18 @@ def forget(
         return
     if not query:
         raise typer.BadParameter("need QUERY or --id ID")
+    if not match and not hard:
+        try:
+            plan = c.resolve(query)
+        except ApiError as e:  # resolver/LLM unreachable → fall back to literal matching
+            if e.status != 503:
+                R.error(str(e))
+                raise typer.Exit(code=e.exit_code)
+            plan = None
+            R.warn(f"resolver unavailable ({e}); falling back to literal --match mode")
+        if plan is not None:
+            _resolve_flow(ctx, query, expect="forget", yes=yes, plan=plan)
+            return
     matches = _run(ctx, c.list_facts, q=query, status="any", limit=limit)
     matches = [m for m in matches if m.get("status") not in ("deleted",)]
     if not matches:
@@ -964,6 +1140,184 @@ def wipe_user(
     else:
         R.ok(f"wiped user [bold]{user_id}[/bold]" + (f": {R._kv(res)}" if isinstance(res, dict)
                                                        and res else ""))
+
+
+# ============================================================ Graph & aliases
+def _graph_node_arg(node: str) -> str:
+    """Bare short fact ids are not resolvable here (entity names may look like anything) — pass through."""
+    return node.strip()
+
+
+@app.command(rich_help_panel=P_GRAPH)
+def graph(
+    ctx: typer.Context,
+    node: str = typer.Argument(..., help="Entity name (e.g. johnny), 'entity:NAME' or 'fact:UUID'."),
+    depth: int = typer.Option(2, "--depth", "-d", min=0, max=6, help="Hops to walk (undirected)."),
+    fanout: Optional[int] = typer.Option(None, "--fanout", help="Max edges followed per node per hop."),
+):
+    """Walk the memory graph around NODE: a tree of reachable entities/facts with the relation of
+    each hop (GET /graph). Aliases resolve to their canonical entity.
+
+    [dim]Examples:[/dim]  [cyan]astoria graph johnny[/cyan]  ·  [cyan]astoria graph specul8-o-matic --depth 1[/cyan]
+    """
+    c = _ctx(ctx).client
+    g = _run(ctx, c.graph, _graph_node_arg(node), depth=depth, fanout=fanout)
+    if _ctx(ctx).json:
+        R.print_json(g)
+        return
+    if not (g.get("nodes") or []):
+        R.empty("graph nodes")
+        return
+    R.console.print(R.graph_tree(g))
+
+
+@app.command(rich_help_panel=P_GRAPH)
+def edges(
+    ctx: typer.Context,
+    node: Optional[str] = typer.Option(None, "--node", "-N", help="Only edges touching this node "
+                                                                 "(entity name / entity:NAME / fact:UUID)."),
+    relation: Optional[str] = typer.Option(None, "--relation", "-r", help="Only this relation (snake_case)."),
+    depth: int = typer.Option(0, "--depth", "-d", min=0, max=6,
+                              help="With --node: also edges within DEPTH hops."),
+    status: str = typer.Option("active", "--status", help="active | retracted | archived | superseded | any"),
+    limit: int = typer.Option(200, "--limit", "-n"),
+):
+    """List graph edges (GET /edges): src —relation→ dst with weight, confidence, provenance.
+
+    [dim]Examples:[/dim]  [cyan]astoria edges[/cyan]  ·  [cyan]astoria edges --node johnny --depth 1[/cyan]
+    ·  [cyan]astoria edges --relation runs_on[/cyan]
+    """
+    c = _ctx(ctx).client
+    rows = _run(ctx, c.list_edges, node=node, relation=relation, depth=depth, status=status, limit=limit)
+    if isinstance(rows, dict):
+        rows = rows.get("edges") or rows.get("items") or []
+    if _ctx(ctx).json:
+        R.print_json(rows)
+        return
+    if not rows:
+        R.empty("edges")
+        return
+    R.console.print(R.edges_table(rows))
+
+
+@edge_app.command("add")
+def edge_add(
+    ctx: typer.Context,
+    src: str = typer.Argument(..., help="Source node: entity name, entity:NAME or fact:UUID."),
+    relation: str = typer.Argument(..., help="snake_case relation: part_of, located_in, works_at, owns, "
+                                             "runs_on, depends_on, related_to ..."),
+    dst: str = typer.Argument(..., help="Destination node."),
+    weight: Optional[float] = typer.Option(None, "--weight", "-w", help="Edge weight (default 1)."),
+    confidence: Optional[float] = typer.Option(None, "--confidence", help="0-1 (default .90 explicit)."),
+    evidence: Optional[str] = typer.Option(None, "--evidence", help="Verbatim support snippet."),
+    valid_from: Optional[str] = typer.Option(None, "--from", help="Valid-from date."),
+    valid_to: Optional[str] = typer.Option(None, "--to", help="Valid-to date."),
+):
+    """Assert an edge SRC —RELATION→ DST (POST /edges). Idempotent: re-adding an active edge bumps it.
+    Entity endpoints are auto-registered; aliases resolve to their canonical entity.
+
+    [dim]Example:[/dim]  [cyan]astoria edge add johnny runs_on specul8-o-matic[/cyan]
+    """
+    c = _ctx(ctx).client
+    res = _run(ctx, c.add_edge, src, relation, dst, weight=weight, confidence=confidence, evidence=evidence,
+               valid_from=parse_date(valid_from), valid_to=parse_date(valid_to))
+    if _ctx(ctx).json:
+        R.print_json(res)
+        return
+    e = res.get("edge") or {}
+    R.ok(f"{res.get('action', 'ok')}: [bold]{escape(str(e.get('src')))}[/bold] "
+         f"[magenta]{escape(str(e.get('relation')))}[/magenta] [bold]{escape(str(e.get('dst')))}[/bold] "
+         f"[dim](id {R.short_id(e.get('id'))} · conf {R.fmt_num(e.get('confidence'))})[/dim]")
+
+
+@edge_app.command("rm")
+def edge_rm(
+    ctx: typer.Context,
+    edge_id: str = typer.Argument(..., help="Edge id (full uuid or unique prefix as printed by `edges`)."),
+    hard: bool = typer.Option(False, "--hard", help="Delete the row instead of retracting it."),
+):
+    """Retract (default) or hard-delete an edge (DELETE /edges/ID).
+
+    [dim]Example:[/dim]  [cyan]astoria edge rm 3f2a1c9b[/cyan]
+    """
+    c = _ctx(ctx).client
+    eid = edge_id.strip()
+    if len(eid) < 32:
+        rows = _run(ctx, c.list_edges, status="any", limit=2000)
+        matches = sorted({str(r.get("id")) for r in rows if str(r.get("id", "")).startswith(eid)})
+        if len(matches) != 1:
+            R.error(f"{'no' if not matches else 'ambiguous'} edge id starting with '{eid}'")
+            raise typer.Exit(code=EXIT_ERROR)
+        eid = matches[0]
+    res = _run(ctx, c.delete_edge, eid, mode="hard" if hard else "retract")
+    if _ctx(ctx).json:
+        R.print_json(res)
+    else:
+        e = res.get("edge") or {}
+        R.ok(f"{res.get('mode')}: {escape(str(e.get('src')))} {escape(str(e.get('relation')))} "
+             f"{escape(str(e.get('dst')))} [dim]({R.short_id(eid)})[/dim]")
+
+
+@alias_app.command("add")
+def alias_add(
+    ctx: typer.Context,
+    alias: str = typer.Argument(..., help="The other name."),
+    canonical: str = typer.Argument(..., help="The name to keep (what fact.subject holds)."),
+):
+    """Declare ALIAS to mean CANONICAL (POST /aliases): every later write/read on ALIAS lands on
+    CANONICAL. Chains are flattened; the user_id itself cannot be aliased away.
+
+    [dim]Example:[/dim]  [cyan]astoria alias add specul8 specul8-o-matic[/cyan]
+    """
+    c = _ctx(ctx).client
+    res = _run(ctx, c.add_alias, alias, canonical)
+    if _ctx(ctx).json:
+        R.print_json(res)
+    else:
+        a = res.get("alias") or {}
+        extra = f" · re-pointed {res['repointed']}" if res.get("repointed") else ""
+        R.ok(f"{res.get('action', 'ok')}: [bold]{escape(str(a.get('alias')))}[/bold] → "
+             f"[cyan]{escape(str(a.get('canonical')))}[/cyan]{extra}")
+
+
+@alias_app.command("list")
+def alias_list(
+    ctx: typer.Context,
+    canonical: Optional[str] = typer.Option(None, "--canonical", "-c", help="Only aliases of this canonical name."),
+):
+    """List subject aliases (GET /aliases).
+
+    [dim]Example:[/dim]  [cyan]astoria alias list[/cyan]  ·  [cyan]astoria alias list -c specul8-o-matic[/cyan]
+    """
+    c = _ctx(ctx).client
+    rows = _run(ctx, c.list_aliases, canonical=canonical)
+    if isinstance(rows, dict):
+        rows = rows.get("aliases") or rows.get("items") or []
+    if _ctx(ctx).json:
+        R.print_json(rows)
+        return
+    if not rows:
+        R.empty("aliases")
+        return
+    R.console.print(R.aliases_table(rows))
+
+
+@alias_app.command("rm")
+def alias_rm(
+    ctx: typer.Context,
+    alias: str = typer.Argument(..., help="The alias to remove."),
+):
+    """Remove an alias (DELETE /aliases/ALIAS). Facts already written under the canonical name stay.
+
+    [dim]Example:[/dim]  [cyan]astoria alias rm specul8[/cyan]
+    """
+    c = _ctx(ctx).client
+    res = _run(ctx, c.delete_alias, alias)
+    if _ctx(ctx).json:
+        R.print_json(res)
+    else:
+        a = res.get("alias") or {}
+        R.ok(f"removed alias [bold]{escape(str(a.get('alias')))}[/bold] → {escape(str(a.get('canonical')))}")
 
 
 # ======================================================================= Data

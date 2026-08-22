@@ -409,3 +409,82 @@ def profile_panel(narrative: str, version: Any = None) -> Panel:
 
 def code_block(text: str, lexer: str = "json") -> Syntax:
     return Syntax(text, lexer, theme="ansi_dark", word_wrap=True)
+
+
+# ----------------------------------------------------------------------- graph
+def _node_text(n: dict) -> Text:
+    kind = str(n.get("kind") or "")
+    name = str(n.get("name") or n.get("id") or "")
+    if kind == "fact":
+        t = Text.assemble(("fact ", "dim"), (short_id(name), "dim"), " ", (str(n.get("label") or ""), "cyan"))
+    else:
+        t = Text.assemble((name, "bold"))
+        if n.get("entity_kind"):
+            t.append(f" ({n['entity_kind']})", style="dim")
+        if n.get("aliases"):
+            t.append("  aka " + ", ".join(n["aliases"]), style="dim")
+        if n.get("facts") is not None:
+            t.append(f"  [{n['facts']} facts]", style="dim")
+    return t
+
+
+def graph_tree(g: dict) -> Tree:
+    """/graph payload → rich tree: root, then children by path (hops)."""
+    nodes = g.get("nodes") or []
+    edges = g.get("edges") or []
+    by_id = {n["id"]: n for n in nodes}
+    root_id = g.get("root")
+    root = by_id.get(root_id) or {"id": root_id, "kind": "entity", "name": root_id}
+    title = _node_text(root)
+    title.append(f"   depth {g.get('depth')} · {len(nodes)} nodes · {len(edges)} edges", style="dim")
+    tree = Tree(title)
+    branches: dict[str, Tree] = {root_id: tree}
+    for n in sorted(nodes, key=lambda x: (int(x.get("hops") or 0), str(x.get("id")))):
+        if n["id"] == root_id:
+            continue
+        path = n.get("path") or []
+        parent_id = path[-2] if len(path) >= 2 else root_id
+        parent = branches.get(parent_id, tree)
+        arrow = "→" if n.get("direction") == "out" else "←"
+        label = Text.assemble((f"{arrow} {n.get('via') or ''} ", "magenta"))
+        label.append_text(_node_text(n))
+        branches[n["id"]] = parent.add(label)
+    return tree
+
+
+def edges_table(rows: list[dict], title: str = "edges") -> Table:
+    """src —relation→ dst per row; weight shown as ×w when ≠ 1; provenance in --json / `graph`."""
+    t = Table(title=f"{title} ({len(rows)})", box=box.SIMPLE_HEAVY, expand=False, pad_edge=False)
+    t.add_column("id", style="dim", no_wrap=True)
+    t.add_column("src", no_wrap=True, overflow="ellipsis")
+    t.add_column("relation", style="magenta", no_wrap=True)
+    t.add_column("dst", no_wrap=True, overflow="ellipsis")
+    t.add_column("conf", justify="right", no_wrap=True)
+    t.add_column("status", no_wrap=True)
+    t.add_column("src kind", no_wrap=True, overflow="ellipsis")
+    for r in rows:
+        st = str(r.get("status") or "")
+        w = r.get("weight")
+        wtxt = f" ×{fmt_num(w, 1)}" if w not in (None, 1, 1.0) else ""
+        t.add_row(short_id(r.get("id")), _edge_end(r, "src"), f"{r.get('relation') or ''}{wtxt}", _edge_end(r, "dst"),
+                  fmt_conf(r.get("confidence")), Text(st, style=STATUS_STYLE.get(st, "")),
+                  str(r.get("source_kind") or ""))
+    return t
+
+
+def _edge_end(r: dict, side: str) -> str:
+    kind, nid = r.get(f"{side}_kind"), str(r.get(f"{side}_id") or "")
+    return f"fact:{short_id(nid)}" if kind == "fact" else nid
+
+
+def aliases_table(rows: list[dict]) -> Table:
+    t = Table(title=f"aliases ({len(rows)})", box=box.SIMPLE_HEAVY)
+    t.add_column("alias", style="bold")
+    t.add_column("→", no_wrap=True)
+    t.add_column("canonical", style="cyan")
+    t.add_column("source", no_wrap=True)
+    t.add_column("created", no_wrap=True)
+    for r in rows:
+        t.add_row(str(r.get("alias") or ""), "→", str(r.get("canonical") or ""),
+                  f"{r.get('source') or ''}/{r.get('source_kind') or ''}", fmt_dt(r.get("created_at"), True))
+    return t

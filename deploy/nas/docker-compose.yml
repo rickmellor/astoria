@@ -2,6 +2,9 @@
 #   astoria-postgres : pgvector/pgvector:pg18, data in ./pgdata (bind mount)
 #   astoria          : the service (REST :8933 + MCP /mcp/) + in-process workers
 #   astoria-backup   : pg_dump sidecar → ./backups (every 6h, keep 14) — no cron/sudo needed on UGOS
+#   astoria-rerank   : TEI cross-encoder (cross-encoder/ms-marco-MiniLM-L-6-v2, :8935) — optional recall
+#                      rerank stage; the service reaches it via the host IP (separate-compose pattern), so
+#                      it is published on the LAN too. Model snapshot lives in ./rerank-model (not in git).
 # Embeddings come from the existing always-on TEI nomic container (memoryos-tei, :8931)
 # via the host IP — separate compose, same NAS (the MegaPlan→MemoryOS pattern).
 services:
@@ -40,6 +43,26 @@ services:
     depends_on:
       astoria-postgres:
         condition: service_healthy
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    restart: unless-stopped
+
+  astoria-rerank:
+    # same digest-pinned TEI cpu image as /volume1/docker/memoryos (2026-07-14); bump deliberately, never track a tag
+    image: ghcr.io/huggingface/text-embeddings-inference@sha256:cb570aabbfa016b86684f576b5bd72d1ee96cc0b7a00b0ad221b298762b32157
+    container_name: astoria-rerank
+    # Mount path == model id: TEI reports it in /info and rerank.py asserts it mentions rerank/MiniLM/bge.
+    # ./rerank-model holds the HF snapshot INCLUDING onnx/model.onnx — TEI's CPU image picks the ORT backend
+    # when that file exists (2x faster than candle here: ~11 ms/hook vs ~22). CPU-bound: ~0.3 ms/token, all cores.
+    # Small batch caps: the default 16k-token warmup OOM-loops the 7 GiB NAS; recall reranks ≤ top_n short hooks.
+    # max-concurrent-requests counts queued TEXTS (one permit per text, 429 when exhausted) → keep it high.
+    command: >-
+      --model-id /models/rerank --port 80 --auto-truncate
+      --max-batch-tokens 4096 --max-client-batch-size 32 --max-concurrent-requests 512
+    mem_limit: 1g
+    ports:
+      - "8935:80"                       # LAN + loopback (0.0.0.0 covers 127.0.0.1; a second loopback bind conflicts)
+    volumes:
+      - ./rerank-model:/models/rerank:ro
     logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
     restart: unless-stopped
 

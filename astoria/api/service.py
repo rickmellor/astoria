@@ -201,6 +201,7 @@ def _recall(c, p: dict, client: str) -> dict:
         max_tokens=_int(p.get("max_tokens"), 1000, 50, 20000), limit=_int(p.get("limit"), 12, 1, 200),
         facts_only=_bool(p.get("facts_only")), include_profile=_bool(p.get("include_profile")),
         as_of=_ts(p.get("as_of")), as_believed_at=_ts(p.get("as_believed_at")), client=client,
+        rerank=(None if p.get("rerank") in (None, "") else _bool(p.get("rerank"))),
     )
     layers = _layers(p.get("layers"))
     if layers:
@@ -521,6 +522,11 @@ def _health() -> dict:
         out["llm"] = llm.llm_health()
     except Exception as e:  # noqa: BLE001
         out["llm"] = {"saint": f"unreachable ({e})", "fallback": bool(s.anthropic_api_key)}
+    try:
+        from astoria.core import rerank as _rr
+        out["rerank"] = _rr.rerank_health()
+    except Exception as e:  # noqa: BLE001
+        out["rerank"] = {"ok": False, "error": str(e)}
     return out
 
 

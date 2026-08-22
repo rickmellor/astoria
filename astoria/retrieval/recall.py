@@ -5,11 +5,14 @@
                   top-20 ⊕ top-20 over episodes (summary/note/import/turn, not this session's turns)
     rrf         = Σ 1/(60+rank) over the lists an entity appears in
     score       = rrf × (0.25 + 0.25·recency + 0.25·importance + 0.25·trust)
+    rerank      = optional: top-N fact hooks + top-6 episode hooks → TEI cross-encoder (astoria/core/rerank.py);
+                  score ← (1-w)·norm(score) + w·norm(sigmoid(logit)); `rerank=False` / settings bypass
     collapse    = one row per FUNCTIONAL (subject,predicate); all rows for SET keys
     budget      = facts first, then ≤3 episodes; ≈chars/4 ≤ max_tokens; ≤ limit items
     stale_hint  = a newer active episode mentions the key but not the value (FTS + ILIKE)
     side-effects= one `snapshot` row; access_count/last_seen bump on what was shown
-TEI down → BM25-only + health.degraded. `as_of` → facts.as_of rows ranked by BM25 only.
+TEI down → BM25-only + health.degraded. Reranker down → base ranking + health.rerank="down".
+`as_of` → facts.as_of rows ranked by BM25 only.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ from typing import Any, Iterable
 import psycopg
 
 from astoria.config import settings
+from astoria.core import rerank as _rerank
 from astoria.core.embed import embed_one
 from astoria.store import facts
 
@@ -34,6 +38,7 @@ RRF_K = 60
 VEC_TOPN_FACTS, BM25_TOPN_FACTS = 40, 40
 VEC_TOPN_EPIS, BM25_TOPN_EPIS = 20, 20
 MAX_EPISODES = 3
+RERANK_EPISODES = 2 * MAX_EPISODES   # episode hooks are ~4x the tokens of fact hooks and ≤3 are ever shown
 EPISODE_TRUST = 0.6
 HALF_LIFE_DAYS = {"episodic": 30.0, "semantic": 180.0, "belief": 60.0}
 CONTEXT_HEADER = "Relevant memory (current facts are authoritative; past conversation may be outdated):"
@@ -237,12 +242,16 @@ def _fact_as_of(c: psycopg.Connection, user_id: str, at: datetime, as_believed_a
 # ---------------------------------------------------------------------------
 # scoring / shaping
 
-def _score_facts(cands: dict, now: datetime) -> list[dict]:
+def _score_facts(cands: dict, now: datetime, collapse: bool = True) -> list[dict]:
     scored = []
     for rrf, r in cands.values():
         r = dict(r); r["_kind"] = "fact"; r["score"] = rrf * _fact_weight(r, now); scored.append(r)
     scored.sort(key=lambda r: (-r["score"], str(r["id"])))
-    # collapse by (subject, predicate): functional → best row; set → all
+    return _collapse_facts(scored) if collapse else scored
+
+
+def _collapse_facts(scored: list[dict]) -> list[dict]:
+    """Input sorted by score desc. Collapse by (subject, predicate): functional → best row; set → all."""
     out, seen_func = [], set()
     for r in scored:
         key = (r["subject"], r["predicate"])
@@ -262,6 +271,30 @@ def _score_episodes(cands: dict, now: datetime) -> list[dict]:
     return scored
 
 
+def _apply_rerank(query: str, fact_rows: list[dict], epi_rows: list[dict]) -> str:
+    """Cross-encoder stage over the top-N fact candidates + the top RERANK_EPISODES episode candidates (both
+    lists arrive sorted by score) BEFORE collapse/budget. Mutates `score` in place (blend of normalised base
+    score and normalised sigmoid(logit) over the whole pool, mapped back into the pool's base-score range)
+    and sets `rerank_score` (raw logit) on reranked rows. Returns the health word: "on" (scores applied /
+    nothing to rerank) or "down" (endpoint unavailable → base order kept)."""
+    s = settings()
+    top_n = max(0, int(getattr(s, "rerank_top_n", 30) or 0))
+    pool = fact_rows[:top_n] + epi_rows[:min(top_n, RERANK_EPISODES)]
+    if not pool:
+        return "on"
+    logits = _rerank.rerank(query, [r.get("hook") or "" for r in pool])
+    if logits is None:
+        return "down"
+    blended = _rerank.blend([float(r["score"]) for r in pool], logits, float(getattr(s, "rerank_weight", 0.6)))
+    for r, lg, sc in zip(pool, logits, blended):
+        if lg is not None:
+            r["rerank_score"] = float(lg)
+        r["score"] = sc
+    fact_rows.sort(key=lambda r: (-r["score"], str(r["id"])))
+    epi_rows.sort(key=lambda r: (-r["score"], str(r["id"])))
+    return "on"
+
+
 def _fact_item(r: dict) -> dict:
     return {
         "id": str(r["id"]), "layer": r["layer"], "kind": "fact", "text": r["hook"],
@@ -272,6 +305,7 @@ def _fact_item(r: dict) -> dict:
         "valid_to": _iso(r.get("valid_to")), "occurred_at": None, "last_seen": _iso(r.get("last_seen")),
         "is_belief": bool(r.get("is_belief")), "stale_hint": bool(r.get("stale_hint", False)),
         "cardinality": r["cardinality"], "status": r.get("status", "active"),
+        **({"rerank_score": round(float(r["rerank_score"]), 4)} if r.get("rerank_score") is not None else {}),
     }
 
 
@@ -285,6 +319,7 @@ def _episode_item(r: dict) -> dict:
         "occurred_at": _iso(r.get("occurred_at")), "last_seen": _iso(r.get("last_seen")),
         "is_belief": False, "stale_hint": False,
         "episode_kind": r["kind"], "session_id": r.get("session_id"),
+        **({"rerank_score": round(float(r["rerank_score"]), 4)} if r.get("rerank_score") is not None else {}),
     }
 
 
@@ -381,8 +416,10 @@ def _profile(c: psycopg.Connection, user_id: str, limit: int = 30) -> dict:
 def recall(c: psycopg.Connection, *, user_id: str, query: str, session_id: str | None = None,
            layers: Iterable[str] | None = DEFAULT_LAYERS, max_tokens: int = 1000, limit: int = 12,
            facts_only: bool = False, include_profile: bool = False, as_of: Any = None,
-           as_believed_at: Any = None, client: str | None = None, min_cosine: float | None = None) -> dict:
-    """Hybrid recall → the REST /recall response dict (items, working, profile, context, health, snapshot_id)."""
+           as_believed_at: Any = None, client: str | None = None, min_cosine: float | None = None,
+           rerank: bool | None = None) -> dict:
+    """Hybrid recall → the REST /recall response dict (items, working, profile, context, health, snapshot_id).
+    `rerank`: None → settings.rerank_enabled; False bypasses the cross-encoder stage (health.rerank="off")."""
     now = _now()
     query = (query or "").strip()
     layers = tuple(layers) if layers else DEFAULT_LAYERS
@@ -421,8 +458,31 @@ def recall(c: psycopg.Connection, *, user_id: str, query: str, session_id: str |
         if tsq:
             epi_bm = _episode_bm25(c, user_id, tsq, BM25_TOPN_EPIS, session_id, at)
 
-    fact_rows = _score_facts(_rrf(fact_vec, fact_bm), now)
-    epi_rows = _score_episodes(_rrf(epi_vec, epi_bm), now)[:MAX_EPISODES]
+    fact_rows = _score_facts(_rrf(fact_vec, fact_bm), now, collapse=False)
+    epi_rows = _score_episodes(_rrf(epi_vec, epi_bm), now)
+
+    # --- graph expansion: facts reachable from the top seeds via edges/entities (bounded) ------
+    if fact_rows and at is None and int(getattr(settings(), "graph_max_depth", 2) or 0) > 0:
+        try:
+            from astoria.retrieval.graph import expand_candidates
+            seeds = [r["id"] for r in fact_rows[:10]]
+            have = {r["id"] for r in fact_rows}
+            base = min(r["score"] for r in fact_rows)
+            for g in expand_candidates(c, user_id, seeds):
+                if g["id"] in have or g.get("layer") not in fact_layers:
+                    continue
+                g = dict(g); g["_kind"] = "fact"
+                g["score"] = base / (1.0 + float(g.get("graph_hops") or 1))   # hop penalty below the seeds
+                fact_rows.append(g); have.add(g["id"])
+            fact_rows.sort(key=lambda r: (-r["score"], str(r["id"])))
+        except Exception as e:  # noqa: BLE001 — graph is an enrichment, never a failure
+            log.debug("graph expansion skipped: %s", e)
+
+    # --- rerank (optional cross-encoder over the top-N, before collapse/budget) --------
+    do_rerank = (rerank is not False) and _rerank.enabled()
+    health["rerank"] = _apply_rerank(query, fact_rows, epi_rows) if do_rerank else "off"
+    fact_rows = _collapse_facts(fact_rows)
+    epi_rows = epi_rows[:MAX_EPISODES]
 
     # --- budget: facts first, then episodes --------------------------------------
     selected: list[dict] = []
