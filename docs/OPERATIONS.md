@@ -231,3 +231,18 @@ scripts/smoke.sh                                          # 5-second post-deploy
 ```
 Acceptance tests skip when `/health` is unreachable and fall back to API-only variants when they cannot
 reach the service's DB directly.
+
+## Addendum 2026-08-22 (post scale validation)
+
+- **Embedding endpoints are prioritized** (`ASTORIA_EMBED_URLS="url|model,url|model"`, default: workstation
+  nomic seat via SAINT `http://192.168.1.221:4000|saint-local-embed` → NAS TEI `http://192.168.1.134:8931|nomic`).
+  Each endpoint is verified (served model mentions nomic; canary vector-space check cosine ≥ 0.98 against the
+  first verified endpoint) and cooled down 60 s on failure, so the workstation is picked up within a minute of
+  power-on and the NAS TEI carries the night. `/health.tei` shows `active` + per-endpoint status. The workstation
+  seat is ~4× faster (≈64 ms vs ≈280 ms per query) — see `docs/PERFORMANCE.md` for why that matters.
+- **Schema 002** adds indexes on `fact.supersedes` / `fact.superseded_by` — mass delete/forget/wipe depends on
+  them (100k-row wipe: 17+ min → 7 s). Applied automatically at service start.
+- **`hnsw.iterative_scan=relaxed_order`** is set per recall so a user with a small share of the index still gets
+  full vector candidates (filtered-HNSW starvation fix).
+- Supersede path embeds **before** the per-key advisory lock (concurrent corrections on one key no longer
+  serialise on the embedder).
