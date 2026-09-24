@@ -46,3 +46,18 @@ convertible (converter rejects `Qwen3ForSequenceClassification`).
   when specul8 is down).
 - The batching ceiling on SYCL is worth one more look before committing (a Mesa 26 Vulkan container, or batching several
   documents per request on the client side).
+
+## Wired in (2026-09-23 evening)
+
+- Astoria `core/rerank.py` gained a **llama.cpp flavour** (auto-detected: `/info` 404 → `GET /props`; `POST /v1/rerank
+  {query, documents}`; probabilities → logits). Tests in `tests/test_rerank.py`. Deployed to the NAS.
+- specul8 user unit **`rerank-b50.service`** (`:8936`, alias `Qwen3-Reranker-0.6B`, f16 GGUF from `/mnt/ug-models/Qwen/`,
+  `-np 8 -ub 4096 -fa on`, ReBAR pre-check). Registered in johnny as a systemd seat (device `Arc Pro B50`).
+- `ASTORIA_RERANK_URLS` = B50 → NAS MiniLM → specul8 CPU MiniLM; `ASTORIA_RERANK_TIMEOUT_S` raised 3 → 4 s.
+- Live numbers: Astoria's real call (30 facts + 6 episodes, 240-char hooks) = **1.4 s** measured on specul8 against the seat,
+  **2.3 s** as measured by Astoria from the NAS (network + 3 sequential 16-doc batches; a single 36-doc request is no
+  faster: 1392 vs 1403 ms). Knob sweep on the seat, 36 hooks: `-np 1 -ub 512` 1296 ms, `-np 8 -ub 1024 -t 12` 1393 ms,
+  unit flags 1400 ms, `-fa off` 4607 ms, `-nkvo` 3550 ms — the per-document SYCL cost is the ceiling; keep the unit as is.
+- Recall latency roughly doubles with the stage on (typ. 1.2–1.8 s → 2.5–5 s on a loaded box); the (query, text) cache
+  makes repeated ambient prompts free (~100 ms). If that is too slow for interactive use: `ASTORIA_RERANK_TOP_N=20`
+  (≈0.9 s) or the 4080 with TEI bge-v2-m3 once the judge/sidecar VRAM plan exists.
