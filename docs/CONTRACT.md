@@ -12,7 +12,7 @@ the design record; explanations in [ARCHITECTURE.md](ARCHITECTURE.md); request/r
 - **Store**: Postgres + pgvector (≥ 0.8), schema `astoria/sql/001…004`, applied at start-up.
 - **Embeddings**: nomic-embed-text-v1.5, 768-d, prefixes `search_document:` / `search_query:`, any
   OpenAI-compatible endpoint(s) (`ASTORIA_EMBED_URLS`, priority order, verified vector space).
-  **Reranker** (optional): TEI `POST /rerank`. **LLM**: OpenAI-compatible primary → Anthropic fallback;
+  **Reranker** (optional): TEI `POST /rerank` or llama.cpp `POST /v1/rerank` (flavour auto-detected). **LLM**: OpenAI-compatible primary → Anthropic fallback;
   write path only (cognify, curator) plus the on-demand target resolver.
 - **Identity**: every request carries `user_id` (omitted/empty → `ASTORIA_USER_DEFAULT`, reported in `/health.user_default`). `Authorization: Bearer
   <token>` → client name via `ASTORIA_CLIENT_TOKENS`; else `X-Astoria-Client` hint; else `anonymous`
