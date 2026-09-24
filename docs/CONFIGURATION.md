@@ -79,13 +79,18 @@ Endpoint verification and failure handling (`core/embed.py`):
 
 ## 4. Reranker (optional cross-encoder stage)
 
-Recall can send its top candidates through a TEI cross-encoder reranker (`POST /rerank`, raw logits) and
-blend the result into the ranking. The stage is **off unless `ASTORIA_RERANK_URLS` is set**, and degrades
-to the base ranking when the endpoint is down.
+Recall can send its top candidates through a cross-encoder reranker and blend the result into the ranking.
+The stage is **off unless `ASTORIA_RERANK_URLS` is set**, and degrades to the base ranking when the endpoint
+is down. Two endpoint flavours are recognised, detected per endpoint at verification time (2026-09-23):
+
+| flavour | verification | request | scores |
+|---|---|---|---|
+| **TEI** (`astoria-rerank` on the NAS, MiniLM CPU seat on specul8) | `GET /info` reports `model_type.reranker` or a reranker-ish model id | `POST /rerank {query, texts, raw_scores}` → `[{index, score}]` | raw logits |
+| **llama.cpp** (`llama-server --reranking`; the Qwen3-Reranker-0.6B seat on specul8's Arc Pro B50, `:8936`, user unit `rerank-b50`) | `/info` is 404 → `GET /props` must name a reranker in `model_alias` / `model_path` | `POST /v1/rerank {query, documents, top_n}` → `{results: [{index, relevance_score}]}` | yes/no probabilities, mapped to logits (`log(p/(1-p))`, clamped at ±13.8) so the blend and the no-opinion spread check are unchanged |
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
-| `ASTORIA_RERANK_URLS` | `""` (stage off) | `core/rerank.py` | Priority list `url\|model,url\|model` of TEI reranker endpoints. The model name is informational; the endpoint is verified through `GET /info` (TEI must report `model_type.reranker` or a model id mentioning `rerank`, `minilm` or `bge`). |
+| `ASTORIA_RERANK_URLS` | `""` (stage off) | `core/rerank.py` | Priority list `url\|model,url\|model` of reranker endpoints (TEI or llama.cpp, see above). The model name is informational; the endpoint is verified through `GET /info` (TEI must report `model_type.reranker` or a model id mentioning `rerank`, `minilm` or `bge`). |
 | `ASTORIA_RERANK_ENABLED` | `true` | `core/rerank.py`, `retrieval/recall.py` | Kill switch for a configured stage. A per-request `rerank=false` also bypasses it. |
 | `ASTORIA_RERANK_TOP_N` | `30` | `retrieval/recall.py` | How many fact candidates (by base score) are reranked; plus the top 6 episode candidates (`recall.RERANK_EPISODES`). CPU-bound: ~0.3 ms per token on a small NAS CPU; 30 facts + 6 episodes ≈ 300–350 ms cold. Raise only with a GPU reranker. |
 | `ASTORIA_RERANK_WEIGHT` | `0.6` | `retrieval/recall.py` | `final = (1-w)·norm(base) + w·norm(sigmoid(logit))`, both min-max normalised over the reranked set and mapped back into the base-score range. |

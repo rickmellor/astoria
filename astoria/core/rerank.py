@@ -13,6 +13,12 @@ None means "skip the stage, keep the base ranking" and recall reports `health.re
 Scores are the cross-encoder's raw logits (TEI `raw_scores=true`; this model's activation is Identity,
 so it is what sentence-transformers' CrossEncoder.predict returns). recall.py blends sigmoid(logit),
 min-max normalised over the reranked set, with the normalised base score — see `blend()`.
+Two endpoint flavours, detected once per endpoint at verification time and remembered in `_state`:
+  * `tei`      — Hugging Face TEI: `GET /info` (model_type.reranker), `POST /rerank {query, texts}` → `[{index, score}]`
+  * `llamacpp` — llama.cpp `llama-server --reranking` (e.g. Qwen3-Reranker-0.6B on the Arc Pro B50, 2026-09-23):
+                 `GET /props` (model_alias / model_path must name a reranker), `POST /v1/rerank {query, documents}`
+                 → `{results: [{index, relevance_score}]}`. Its scores are yes/no probabilities, mapped back to
+                 logits (`_logit`) so blend() and MIN_LOGIT_SPREAD keep their meaning.
 """
 from __future__ import annotations
 
@@ -31,6 +37,8 @@ log = logging.getLogger("astoria.rerank")
 COOLDOWN_S = 60.0
 WRONG_MODEL_COOLDOWN_S = 600.0
 MODEL_HINTS = ("rerank", "minilm", "bge")
+FLAVOR_TEI, FLAVOR_LLAMACPP = "tei", "llamacpp"
+PROB_CLAMP = 1e-6               # llama.cpp probabilities → logits: keep log-odds finite (±13.8)
 # Cross-encoder cost is token-linear and CPU-bound on the NAS (~0.3 ms/token, all cores): 30 mixed hooks of
 # which 12 are 350-char episode hooks = ~700 ms. Capped at 240 chars (≈60 tokens, still the whole gist of a
 # hook) and with recall limiting episodes to 6, top_n=30 facts is ~300-350 ms. Bump only with a GPU reranker.
@@ -82,25 +90,51 @@ def _mark_fail(base: str, err: str, cooldown: float = COOLDOWN_S) -> None:
     log.warning("rerank endpoint %s failed (%s); cooling down %ss", base, err, int(cooldown))
 
 
-def _verify(client: httpx.Client, base: str, model: str) -> bool:
-    """Served-model assertion: GET /info must describe a reranker (TEI `model_type: {reranker: ...}`) or
-    name one (model_id / served_model_name mentions rerank|MiniLM|bge). The configured model name is
-    deliberately NOT consulted — it is what we expect, not what is served."""
-    info = client.get(f"{base}/info", timeout=4).json()
-    names = " ".join(str(info.get(k) or "") for k in ("model_id", "served_model_name"))
-    mt = info.get("model_type")
-    is_reranker = isinstance(mt, dict) and "reranker" in mt
-    name_ok = any(h in names.lower() for h in MODEL_HINTS)
-    if not (is_reranker or name_ok):
-        log.error("rerank endpoint %s: served model %r is not a reranker — disabled", base, names.strip())
-        return False
-    return True
+def _verify(client: httpx.Client, base: str, model: str) -> str | None:
+    """Served-model assertion, and flavour detection. TEI: GET /info must describe a reranker (`model_type:
+    {reranker: ...}`) or name one (model_id / served_model_name mentions rerank|MiniLM|bge). llama.cpp has no
+    /info (404): GET /props must name a reranker in model_alias / model_path. The configured model name is
+    deliberately NOT consulted — it is what we expect, not what is served. Returns the flavour, or None."""
+    r = client.get(f"{base}/info", timeout=4)
+    if r.status_code == 200:
+        info = r.json()
+        names = " ".join(str(info.get(k) or "") for k in ("model_id", "served_model_name"))
+        mt = info.get("model_type")
+        is_reranker = isinstance(mt, dict) and "reranker" in mt
+        name_ok = any(h in names.lower() for h in MODEL_HINTS)
+        if not (is_reranker or name_ok):
+            log.error("rerank endpoint %s: served model %r is not a reranker — disabled", base, names.strip())
+            return None
+        return FLAVOR_TEI
+    r = client.get(f"{base}/props", timeout=4)
+    if r.status_code == 200:
+        props = r.json()
+        names = " ".join(str(props.get(k) or "") for k in ("model_alias", "model_path"))
+        if not any(h in names.lower() for h in MODEL_HINTS):
+            log.error("rerank endpoint %s: llama.cpp serves %r, not a reranker — disabled", base, names.strip())
+            return None
+        return FLAVOR_LLAMACPP
+    log.error("rerank endpoint %s: neither TEI /info nor llama.cpp /props answered (HTTP %s) — disabled", base, r.status_code)
+    return None
 
 
-def _post(client: httpx.Client, base: str, query: str, texts: list[str]) -> list[float | None]:
+def _logit(p: float) -> float:
+    p = min(1.0 - PROB_CLAMP, max(PROB_CLAMP, float(p)))
+    return math.log(p / (1.0 - p))
+
+
+def _post(client: httpx.Client, base: str, query: str, texts: list[str], flavor: str = FLAVOR_TEI) -> list[float | None]:
+    out: list[float | None] = [None] * len(texts)
+    if flavor == FLAVOR_LLAMACPP:
+        r = client.post(f"{base}/v1/rerank", json={"query": query, "documents": texts, "top_n": len(texts)})
+        r.raise_for_status()
+        for row in (r.json() or {}).get("results", []):
+            i = int(row["index"])
+            if 0 <= i < len(texts):
+                out[i] = _logit(row["relevance_score"])
+        return out
     r = client.post(f"{base}/rerank", json={"query": query, "texts": texts, "truncate": True, "raw_scores": True})
     r.raise_for_status()
-    out: list[float | None] = [None] * len(texts)
     for row in r.json():
         i = int(row["index"])
         if 0 <= i < len(texts):
@@ -141,16 +175,18 @@ def rerank(query: str, docs: list[str]) -> list[float | None] | None:
             with httpx.Client(timeout=timeout) as client:
                 st = _state.setdefault(base, {})
                 if not st.get("verified"):
-                    if not _verify(client, base, model):
+                    flavor = _verify(client, base, model)
+                    if not flavor:
                         _mark_fail(base, "not a reranker", WRONG_MODEL_COOLDOWN_S)
                         continue
                     st["verified"] = True
                     st["model"] = model
+                    st["flavor"] = flavor
                 t0 = time.time()
                 # TEI caps client batches (max_client_batch_size, 32 on the NAS); 16 keeps us under any config.
                 for j in range(0, len(todo), 16):
                     idx = todo[j:j + 16]
-                    for i, v in zip(idx, _post(client, base, query, [texts[i] for i in idx])):
+                    for i, v in zip(idx, _post(client, base, query, [texts[i] for i in idx], st.get("flavor", FLAVOR_TEI))):
                         out[i] = v
                 st["last_ms"] = (time.time() - t0) * 1000
                 st["fail_until"] = 0
@@ -222,8 +258,9 @@ def rerank_health() -> dict:
         if usable and not st.get("verified"):
             try:
                 with httpx.Client(timeout=4) as client:
-                    if _verify(client, base, model):
-                        _state.setdefault(base, {}).update(verified=True, model=model, fail_until=0, error=None)
+                    flavor = _verify(client, base, model)
+                    if flavor:
+                        _state.setdefault(base, {}).update(verified=True, model=model, flavor=flavor, fail_until=0, error=None)
                     else:
                         _mark_fail(base, "not a reranker", WRONG_MODEL_COOLDOWN_S)
                         usable = False
@@ -231,7 +268,7 @@ def rerank_health() -> dict:
                 _mark_fail(base, f"{type(e).__name__}")
                 usable = False
         st = _state.get(base, {})
-        eps.append({"url": base, "model": model, "usable": usable, "verified": bool(st.get("verified")),
+        eps.append({"url": base, "model": model, "flavor": st.get("flavor"), "usable": usable, "verified": bool(st.get("verified")),
                     "last_ms": round(st.get("last_ms", 0) or 0, 1), "error": st.get("error") if not usable else None})
         if usable and active is None:
             active = base

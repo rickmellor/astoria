@@ -6,6 +6,9 @@ documented in `docs/CONTRACT.md`. Entries are feature-level; see git history for
 ## Unreleased (0.1.x, feature-complete wave)
 
 ### Added
+- **llama.cpp reranker flavour** (2026-09-23): `ASTORIA_RERANK_URLS` endpoints may be `llama-server --reranking`
+  (Jina-style `POST /v1/rerank`, verified via `GET /props`); probabilities are mapped back to logits. First use:
+  Qwen3-Reranker-0.6B on specul8's Arc Pro B50 ahead of the NAS MiniLM fallback. `health.rerank.endpoints[].flavor`.
 - **Reranker stage**: optional TEI cross-encoder (`POST /rerank`) over the top-N recall candidates with
   prioritised endpoints, served-model verification, cooldowns, logit blending, per-request `rerank=false`,
   `health.rerank` (`on | off | down`) and a `/health.rerank` block.

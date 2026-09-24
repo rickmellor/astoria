@@ -63,6 +63,40 @@ class _FakeTEI:
         return httpx.Response(200, json=rows, request=httpx.Request("POST", url))
 
 
+class _FakeLlama:
+    """llama.cpp `llama-server --reranking` stand-in: GET /info → 404, GET /props → {model_alias, model_path},
+    POST /v1/rerank {query, documents} → {results: [{index, relevance_score}]} with yes/no PROBABILITIES
+    (sigmoid of the same ±10/−11 logits the TEI fake uses), so the adapter must map them back to logits."""
+
+    def __init__(self, *, alias="Qwen3-Reranker-0.6B", path="/models/Qwen3-Reranker-0.6B-rerank.f16.gguf", log=None):
+        self.alias, self.path = alias, path
+        self.log = log if log is not None else []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, timeout=None):
+        self.log.append(("GET", url))
+        if url.endswith("/info"):
+            return httpx.Response(404, json={"error": {"code": 404, "message": "File Not Found"}}, request=httpx.Request("GET", url))
+        assert url.endswith("/props")
+        return httpx.Response(200, json={"model_alias": self.alias, "model_path": self.path, "total_slots": 8}, request=httpx.Request("GET", url))
+
+    def post(self, url, json=None, **kw):
+        self.log.append(("POST", url, json))
+        assert url.endswith("/v1/rerank") and "documents" in json and "texts" not in json
+        q = set(json["query"].lower().split())
+        rows = []
+        for i, t in enumerate(json["documents"]):
+            hit = any(w in t.lower() for w in q if len(w) > 2)
+            rows.append({"index": i, "relevance_score": RR.sigmoid(10.0 if hit else -11.0)})
+        rows.sort(key=lambda r: -r["relevance_score"])
+        return httpx.Response(200, json={"model": self.alias, "results": rows}, request=httpx.Request("POST", url))
+
+
 @pytest.fixture
 def rerank_env(monkeypatch):
     """Point settings at one fake endpoint; reset endpoint state."""
@@ -149,6 +183,29 @@ def test_rerank_never_raises_and_cools_down_on_error(rerank_env, monkeypatch):
     h = RR.rerank_health()
     assert h["status"] == "on" and h["ok"] and h["active"] == "http://fake:1"
     assert h["endpoints"][0]["verified"] is True and h["endpoints"][0]["usable"] is True
+
+
+def test_llamacpp_flavor_scores_come_back_as_logits(rerank_env, monkeypatch):
+    fake = _use(monkeypatch, _FakeLlama())
+    out = RR.rerank("tell me about my family", ["rick spouse: Jennifer", "rick family: son Paxton", "rick owns equipment: Fluke 87V"])
+    assert out is not None and [round(x, 3) for x in out] == [-11.0, 10.0, -11.0]
+    # /info 404 → /props named a reranker → flavour remembered; the POST went to llama.cpp's Jina-style route
+    assert [m for m, *_ in fake.log] == ["GET", "GET", "POST"]
+    assert fake.log[0][1].endswith("/info") and fake.log[1][1].endswith("/props") and fake.log[2][1].endswith("/v1/rerank")
+    assert RR._state["http://fake:1"]["flavor"] == "llamacpp"
+    RR.rerank("spouse", ["rick has pet: Pineapple"])
+    assert [m for m, *_ in fake.log] == ["GET", "GET", "POST", "POST"]   # no re-verify
+    h = RR.rerank_health()
+    assert h["status"] == "on" and h["endpoints"][0]["flavor"] == "llamacpp"
+    # probabilities at the rails stay finite logits
+    assert RR._logit(0.0) < -13 and RR._logit(1.0) > 13 and abs(RR._logit(0.5)) < 1e-9
+
+
+def test_llamacpp_non_reranker_is_rejected(rerank_env, monkeypatch):
+    _use(monkeypatch, _FakeLlama(alias="coder", path="/models/Qwen3.6-35B-A3B-Q2_K.gguf"))
+    assert RR.rerank("q", ["a", "b"]) is None
+    st = RR._state["http://fake:1"]
+    assert st["fail_until"] > RR.time.time() + 300 and RR.rerank_health()["status"] == "down"
 
 
 def test_rerank_health_off_when_disabled(rerank_env, monkeypatch):

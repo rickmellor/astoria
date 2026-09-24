@@ -14,6 +14,7 @@ use `http://nas.local:8933` as the service URL.
 | `astoria-postgres` | Postgres 18 + pgvector, bind-mounted `./pgdata` | `127.0.0.1:8934` on the host only |
 | `astoria-backup` | `pg_dump -Fc` every `BACKUP_INTERVAL_S`, keep `BACKUP_KEEP` | writes `./backups/astoria-YYYY-MM-DD-HHMM.dump` |
 | `astoria-rerank` (optional) | TEI cross-encoder reranker | `:8935` |
+| `rerank-b50` on specul8 (optional, first in `ASTORIA_RERANK_URLS` since 2026-09-23) | Qwen3-Reranker-0.6B, llama.cpp SYCL on the Arc Pro B50 — systemd **--user** unit, off overnight with the box; the NAS `astoria-rerank` is the always-on fallback | `specul8:8936` |
 | embedder (external) | any nomic-embed-text-v1.5 endpoint(s) named in `ASTORIA_EMBED_URLS` | — |
 | LLM (external) | OpenAI-compatible gateway named in `ASTORIA_LLM_URL`; optional Anthropic fallback | — |
 
@@ -231,7 +232,7 @@ scratch stack from the dump, `astoria export` that user, `astoria import` into p
 | `action: "historical"` when you expected a supersede | the statement's `asserted_at` is older than the active row's (back-dated `asserted_at`, or an old episode `occurred_at` through cognify/import) | assert it again now (explicit `remember` / `POST /facts` without `asserted_at`) |
 | `detector.action: "error"` in a capture response | the detector hit a store error; the episode was stored | read `detector.error`; assert the fact explicitly |
 | recall returns few vector candidates for a user who is a small share of a big index | `hnsw.iterative_scan` not in effect (pgvector < 0.8) | use pgvector ≥ 0.8 (the `pgvector/pgvector:pg18` image does) |
-| `rerank.status: down` | reranker container / endpoint unreachable; `GET <rerank_url>/info` | restart it or set `ASTORIA_RERANK_URLS=` to turn the stage off explicitly |
+| `rerank.status: down` | reranker container / endpoint unreachable; `GET <rerank_url>/info` (TEI) or `GET <rerank_url>/props` (llama.cpp) | restart it (`systemctl --user restart rerank-b50` on specul8 for the B50 seat; it needs ReBAR — `sudo tools/b50-rebar.sh` after a reboot) or set `ASTORIA_RERANK_URLS=` to turn the stage off explicitly |
 | backups stopped (`backup FAILED`) | `docker logs astoria-backup`, disk space, password changed in `.env` without recreating the sidecar | free disk; `docker compose up -d astoria-backup` |
 | hard delete / user wipe is slow | schema 002 indexes missing (very old database) | restart the service (migrations apply) |
 
