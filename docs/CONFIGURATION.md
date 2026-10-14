@@ -86,7 +86,7 @@ is down. Two endpoint flavours are recognised, detected per endpoint at verifica
 | flavour | verification | request | scores |
 |---|---|---|---|
 | **TEI** (`astoria-rerank` on the NAS, MiniLM CPU seat on specul8) | `GET /info` reports `model_type.reranker` or a reranker-ish model id | `POST /rerank {query, texts, raw_scores}` → `[{index, score}]` | raw logits |
-| **llama.cpp** (`llama-server --reranking`; the Qwen3-Reranker-0.6B seat on specul8's Arc Pro B50, `:8936`, user unit `rerank-b50`) | `/info` is 404 → `GET /props` must name a reranker in `model_alias` / `model_path` | `POST /v1/rerank {query, documents, top_n}` → `{results: [{index, relevance_score}]}` | yes/no probabilities, mapped to logits (`log(p/(1-p))`, clamped at ±13.8) so the blend and the no-opinion spread check are unchanged |
+| **llama.cpp** (`llama-server --reranking`; the Qwen3-Reranker-0.6B seat in an R9700's spare VRAM on specul8, `:8936`, user unit `rerank-r9700`; was the Arc Pro B50 until 2026-10-14) | `/info` is 404 → `GET /props` must name a reranker in `model_alias` / `model_path` | `POST /v1/rerank {query, documents, top_n}` → `{results: [{index, relevance_score}]}` | yes/no probabilities, mapped to logits (`log(p/(1-p))`, clamped at ±13.8) so the blend and the no-opinion spread check are unchanged |
 
 | env | default | read by | meaning / when to change |
 |---|---|---|---|
